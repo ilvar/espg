@@ -15,11 +15,19 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type dbPool interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 type server struct {
-	pool *pgxpool.Pool
+	pool dbPool
 }
 
 type bulkOperation struct {
@@ -90,12 +98,60 @@ func getEnv(key, fallback string) string {
 }
 
 func (s *server) registerRoutes(app *fiber.App) {
+	app.Get("/", func(c *fiber.Ctx) error {
+		return s.handleRoot(c)
+	})
+	app.Get("/_cluster/health", func(c *fiber.Ctx) error {
+		return s.handleClusterHealth(c)
+	})
+	app.Head("/:index", func(c *fiber.Ctx) error {
+		index := c.Params("index")
+		if err := assertIdentifier(index, "index name"); err != nil {
+			return writeError(c, fiber.StatusBadRequest, err.Error())
+		}
+		return s.handleHeadIndex(c, index)
+	})
+	app.Get("/:index", func(c *fiber.Ctx) error {
+		index := c.Params("index")
+		if err := assertIdentifier(index, "index name"); err != nil {
+			return writeError(c, fiber.StatusBadRequest, err.Error())
+		}
+		return s.handleGetIndex(c, index)
+	})
 	app.Put("/:index", func(c *fiber.Ctx) error {
 		index := c.Params("index")
 		if err := assertIdentifier(index, "index name"); err != nil {
 			return writeError(c, fiber.StatusBadRequest, err.Error())
 		}
 		return s.handleCreateIndex(c, index)
+	})
+	app.Post("/:index/_doc", func(c *fiber.Ctx) error {
+		index := c.Params("index")
+		if err := assertIdentifier(index, "index name"); err != nil {
+			return writeError(c, fiber.StatusBadRequest, err.Error())
+		}
+		return s.handleCreateDocument(c, index)
+	})
+	app.Put("/:index/_doc/:id", func(c *fiber.Ctx) error {
+		index := c.Params("index")
+		if err := assertIdentifier(index, "index name"); err != nil {
+			return writeError(c, fiber.StatusBadRequest, err.Error())
+		}
+		return s.handleUpsertDocument(c, index, c.Params("id"))
+	})
+	app.Get("/:index/_doc/:id", func(c *fiber.Ctx) error {
+		index := c.Params("index")
+		if err := assertIdentifier(index, "index name"); err != nil {
+			return writeError(c, fiber.StatusBadRequest, err.Error())
+		}
+		return s.handleGetDocument(c, index, c.Params("id"))
+	})
+	app.Delete("/:index/_doc/:id", func(c *fiber.Ctx) error {
+		index := c.Params("index")
+		if err := assertIdentifier(index, "index name"); err != nil {
+			return writeError(c, fiber.StatusBadRequest, err.Error())
+		}
+		return s.handleDeleteDocument(c, index, c.Params("id"))
 	})
 	app.Delete("/:index", func(c *fiber.Ctx) error {
 		index := c.Params("index")
@@ -120,6 +176,73 @@ func (s *server) registerRoutes(app *fiber.App) {
 	})
 }
 
+func (s *server) handleRoot(c *fiber.Ctx) error {
+	return writeJSON(c, fiber.StatusOK, map[string]any{
+		"name":         "espg",
+		"cluster_name": "espg",
+		"version": map[string]any{
+			"number":         "8.0.0",
+			"build_flavor":   "default",
+			"build_type":     "docker",
+			"build_snapshot": true,
+		},
+		"tagline": "You Know, for Search",
+	})
+}
+
+func (s *server) handleClusterHealth(c *fiber.Ctx) error {
+	return writeJSON(c, fiber.StatusOK, map[string]any{
+		"cluster_name":                     "espg",
+		"status":                           "green",
+		"number_of_nodes":                  1,
+		"active_primary_shards":            0,
+		"active_shards":                    0,
+		"relocating_shards":                0,
+		"initializing_shards":              0,
+		"unassigned_shards":                0,
+		"delayed_unassigned_shards":        0,
+		"number_of_pending_tasks":          0,
+		"number_of_in_flight_fetch":        0,
+		"task_max_waiting_in_queue_millis": 0,
+		"active_shards_percent_as_number":  100,
+	})
+}
+
+func (s *server) handleHeadIndex(c *fiber.Ctx, index string) error {
+	exists, err := s.indexExists(c.Context(), index)
+	if err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	}
+	if !exists {
+		return c.SendStatus(fiber.StatusNotFound)
+	}
+	return c.SendStatus(fiber.StatusOK)
+}
+
+func (s *server) handleGetIndex(c *fiber.Ctx, index string) error {
+	exists, err := s.indexExists(c.Context(), index)
+	if err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	}
+	if !exists {
+		return writeError(c, fiber.StatusNotFound, "index not found")
+	}
+	return writeJSON(c, fiber.StatusOK, map[string]any{
+		index: map[string]any{
+			"aliases": map[string]any{},
+			"mappings": map[string]any{
+				"properties": map[string]any{},
+			},
+			"settings": map[string]any{
+				"index": map[string]any{
+					"number_of_shards":   "1",
+					"number_of_replicas": "0",
+				},
+			},
+		},
+	})
+}
+
 func (s *server) handleCreateIndex(c *fiber.Ctx, index string) error {
 	ctx := c.Context()
 	identifier := quoteIdentifier(index)
@@ -138,6 +261,126 @@ func (s *server) handleCreateIndex(c *fiber.Ctx, index string) error {
 	return writeJSON(c, fiber.StatusOK, map[string]any{
 		"acknowledged": true,
 		"index":        index,
+	})
+}
+
+func (s *server) handleCreateDocument(c *fiber.Ctx, index string) error {
+	if ok, err := s.indexExists(c.Context(), index); err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	} else if !ok {
+		return writeError(c, fiber.StatusNotFound, "index not found")
+	}
+
+	var document map[string]any
+	if err := parseDocumentBody(c, &document); err != nil {
+		return writeError(c, fiber.StatusBadRequest, err.Error())
+	}
+
+	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	inserted, err := s.upsertDocument(c.Context(), index, id, document)
+	if err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	status := fiber.StatusCreated
+	result := "created"
+	if !inserted {
+		status = fiber.StatusOK
+		result = "updated"
+	}
+
+	return writeJSON(c, status, map[string]any{
+		"_index": index,
+		"_id":    id,
+		"result": result,
+	})
+}
+
+func (s *server) handleUpsertDocument(c *fiber.Ctx, index string, id string) error {
+	if ok, err := s.indexExists(c.Context(), index); err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	} else if !ok {
+		return writeError(c, fiber.StatusNotFound, "index not found")
+	}
+
+	var document map[string]any
+	if err := parseDocumentBody(c, &document); err != nil {
+		return writeError(c, fiber.StatusBadRequest, err.Error())
+	}
+
+	inserted, err := s.upsertDocument(c.Context(), index, id, document)
+	if err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	status := fiber.StatusCreated
+	result := "created"
+	if !inserted {
+		status = fiber.StatusOK
+		result = "updated"
+	}
+
+	return writeJSON(c, status, map[string]any{
+		"_index": index,
+		"_id":    id,
+		"result": result,
+	})
+}
+
+func (s *server) handleGetDocument(c *fiber.Ctx, index string, id string) error {
+	if ok, err := s.indexExists(c.Context(), index); err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	} else if !ok {
+		return writeError(c, fiber.StatusNotFound, "index not found")
+	}
+
+	identifier := quoteIdentifier(index)
+	query := fmt.Sprintf("SELECT document FROM %s WHERE id = $1", identifier)
+	var document map[string]any
+	if err := s.pool.QueryRow(c.Context(), query, id).Scan(&document); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return writeJSON(c, fiber.StatusNotFound, map[string]any{
+				"_index": index,
+				"_id":    id,
+				"found":  false,
+			})
+		}
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	return writeJSON(c, fiber.StatusOK, map[string]any{
+		"_index":  index,
+		"_id":     id,
+		"found":   true,
+		"_source": document,
+	})
+}
+
+func (s *server) handleDeleteDocument(c *fiber.Ctx, index string, id string) error {
+	if ok, err := s.indexExists(c.Context(), index); err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	} else if !ok {
+		return writeError(c, fiber.StatusNotFound, "index not found")
+	}
+
+	identifier := quoteIdentifier(index)
+	query := fmt.Sprintf("DELETE FROM %s WHERE id = $1", identifier)
+	commandTag, err := s.pool.Exec(c.Context(), query, id)
+	if err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	}
+	if commandTag.RowsAffected() == 0 {
+		return writeJSON(c, fiber.StatusNotFound, map[string]any{
+			"_index": index,
+			"_id":    id,
+			"result": "not_found",
+		})
+	}
+
+	return writeJSON(c, fiber.StatusOK, map[string]any{
+		"_index": index,
+		"_id":    id,
+		"result": "deleted",
 	})
 }
 
@@ -197,7 +440,7 @@ func (s *server) handleBulk(c *fiber.Ctx, index string) error {
 	for _, op := range operations {
 		items = append(items, map[string]any{
 			"index": map[string]any{
-				"_id":   op.ID,
+				"_id":    op.ID,
 				"status": 201,
 			},
 		})
@@ -210,6 +453,12 @@ func (s *server) handleBulk(c *fiber.Ctx, index string) error {
 }
 
 func (s *server) handleSearch(c *fiber.Ctx, index string) error {
+	if ok, err := s.indexExists(c.Context(), index); err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	} else if !ok {
+		return writeError(c, fiber.StatusNotFound, "index not found")
+	}
+
 	var body map[string]any
 	if len(c.Body()) > 0 {
 		decoder := json.NewDecoder(strings.NewReader(string(c.Body())))
@@ -311,6 +560,44 @@ func (s *server) handleSearch(c *fiber.Ctx, index string) error {
 		},
 		"aggregations": aggregations,
 	})
+}
+
+func (s *server) indexExists(ctx context.Context, index string) (bool, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", fmt.Sprintf("public.%s", index)).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+func (s *server) upsertDocument(ctx context.Context, index string, id string, document map[string]any) (bool, error) {
+	identifier := quoteIdentifier(index)
+	query := fmt.Sprintf(`
+		INSERT INTO %s (id, document)
+		VALUES ($1, $2)
+		ON CONFLICT (id) DO UPDATE SET document = EXCLUDED.document
+		RETURNING (xmax = 0)
+	`, identifier)
+	var inserted bool
+	if err := s.pool.QueryRow(ctx, query, id, document).Scan(&inserted); err != nil {
+		return false, err
+	}
+	return inserted, nil
+}
+
+func parseDocumentBody(c *fiber.Ctx, target *map[string]any) error {
+	if len(c.Body()) == 0 {
+		return errors.New("document body required")
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(c.Body())))
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return errors.New("invalid json body")
+	}
+	if len(*target) == 0 {
+		return errors.New("document body required")
+	}
+	return nil
 }
 
 func parseBulk(body []byte) ([]bulkOperation, error) {
