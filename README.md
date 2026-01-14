@@ -82,3 +82,16 @@ Supported aggregations:
 ### Future work / TODO
 - Pass through selected indices (for example, an allowlist like `logs-*` or `metrics-*`) to a real Elasticsearch cluster while keeping the rest backed by Postgres.
 - Automatically create indices when slow queries or aggregations are detected (for example, track query latency and trigger index creation when it consistently exceeds a threshold like 500ms for a given index/field).
+
+### Missing endpoints and query features
+Only the endpoints listed above are implemented. Every other Elasticsearch endpoint is currently missing, including (but not limited to):
+- Index management: `PUT /:index/_mapping`, `GET /:index/_mapping`, `PUT /:index/_settings`, `GET /:index/_settings`, `POST /:index/_aliases`, `GET /_alias`, `GET /_cat/*`.
+- Document APIs: `POST /:index/_update/:id`, `POST /:index/_update_by_query`, `POST /:index/_mget`, `POST /_mget`, `POST /:index/_msearch`, `POST /_msearch`.
+- Search/analytics: `GET /:index/_count`, `POST /:index/_search/scroll`, `POST /_search/scroll`, `POST /_pit`, `DELETE /_pit`, `POST /_search/template`.
+- Cluster/admin: `GET /_cluster/state`, `GET /_nodes`, `GET /_tasks`, `GET /_snapshot/*`, `GET /_ilm/*`, `GET /_security/*`.
+
+Missing query features (only `term`, `match`, `range` with `gte`/`lte`, and `bool.must` are supported today):
+- Boolean query clauses: `bool.filter`, `bool.should`, `bool.must_not`, `minimum_should_match`.
+- Additional query types: `terms`, `match_phrase`, `match_phrase_prefix`, `multi_match`, `query_string`, `simple_query_string`, `prefix`, `wildcard`, `regexp`, `fuzzy`, `ids`, `exists`, `nested`, `geo_*`.
+- Search options: `sort`, `search_after`, `track_total_hits`, `_source` filtering, `stored_fields`, `docvalue_fields`, `highlight`, `suggest`, `rescore`, `collapse`, `timeout`.
+- Aggregations beyond `terms`, `histogram`, and `date_histogram` (for example `avg`, `sum`, `min`, `max`, `stats`, `extended_stats`, `cardinality`, `filters`, `composite`, `significant_terms`, `top_hits`, `nested`).
