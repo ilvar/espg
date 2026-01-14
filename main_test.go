@@ -66,6 +66,7 @@ func (m *mockRows) Values() ([]any, error) {
 	return m.values[m.idx-1], nil
 }
 func (m *mockRows) RawValues() [][]byte { return nil }
+func (m *mockRows) Conn() *pgx.Conn     { return nil }
 
 type mockPool struct {
 	execFn     func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
