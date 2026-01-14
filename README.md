@@ -2,5 +2,5 @@
 What if Postgres pretends to be Elasticsearch?
 
 ## Future work
-* Pass through select indices (for example, `logs-*` and `metrics-*`) directly to a real Elasticsearch cluster while routing the rest through Postgres-backed emulation.
-* Automatically create Postgres-backed indices when a query or aggregation is detected as slow, based on latency thresholds (for example, queries exceeding 500ms) and logging-based detection of repeated slow patterns.
+* Pass through an explicit allowlist of indices (for example, `logs-*` and `metrics-*`) to a real Elasticsearch cluster while routing everything else through Postgres-backed emulation.
+* Automatically create Postgres-backed indices for slow queries and aggregations by flagging requests that exceed a latency threshold (for example, >500ms) or appear repeatedly in slow-query logs.
