@@ -160,6 +160,13 @@ func (s *server) registerRoutes(app *fiber.App) {
 		}
 		return s.handleDeleteIndex(c, index)
 	})
+	app.Post("/:index/_delete_by_query", func(c *fiber.Ctx) error {
+		index := c.Params("index")
+		if err := assertIdentifier(index, "index name"); err != nil {
+			return writeError(c, fiber.StatusBadRequest, err.Error())
+		}
+		return s.handleDeleteByQuery(c, index)
+	})
 	app.Post("/:index/_bulk", func(c *fiber.Ctx) error {
 		index := c.Params("index")
 		if err := assertIdentifier(index, "index name"); err != nil {
@@ -399,6 +406,40 @@ func (s *server) handleDeleteIndex(c *fiber.Ctx, index string) error {
 	})
 }
 
+func (s *server) handleDeleteByQuery(c *fiber.Ctx, index string) error {
+	if ok, err := s.indexExists(c.Context(), index); err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	} else if !ok {
+		return writeError(c, fiber.StatusNotFound, "index not found")
+	}
+
+	var body map[string]any
+	if len(c.Body()) > 0 {
+		decoder := json.NewDecoder(strings.NewReader(string(c.Body())))
+		decoder.UseNumber()
+		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			return writeError(c, fiber.StatusBadRequest, "invalid json body")
+		}
+	}
+
+	values := []any{}
+	whereClause, err := buildWhereClause(body["query"], &values)
+	if err != nil {
+		return writeError(c, fiber.StatusBadRequest, err.Error())
+	}
+
+	identifier := quoteIdentifier(index)
+	query := fmt.Sprintf("DELETE FROM %s %s", identifier, whereClause)
+	commandTag, err := s.pool.Exec(c.Context(), query, values...)
+	if err != nil {
+		return writeError(c, fiber.StatusInternalServerError, err.Error())
+	}
+
+	return writeJSON(c, fiber.StatusOK, map[string]any{
+		"deleted": commandTag.RowsAffected(),
+	})
+}
+
 func (s *server) handleBulk(c *fiber.Ctx, index string) error {
 	body := c.Body()
 	if len(body) == 0 && c.Request().Header.ContentLength() > 0 {
@@ -533,6 +574,8 @@ func (s *server) handleSearch(c *fiber.Ctx, index string) error {
 			bucket := map[string]any{"doc_count": count}
 			switch aggQuery.Type {
 			case "terms":
+				bucket["key"] = key
+			case "histogram":
 				bucket["key"] = key
 			case "date_histogram":
 				switch value := key.(type) {
@@ -766,6 +809,44 @@ func buildAggs(body map[string]any, tableName string, whereClause string) (*aggQ
 			LIMIT %d
 		`, field, tableName, whereClause, limit)
 		return &aggQuery{Name: name, SQL: sql, Type: "terms"}, nil
+	}
+
+	if histogram, ok := aggBody["histogram"].(map[string]any); ok {
+		field, ok := histogram["field"].(string)
+		if !ok {
+			return nil, errors.New("histogram aggregation requires field")
+		}
+		if err := assertIdentifier(field, "histogram field"); err != nil {
+			return nil, err
+		}
+		intervalValue, ok := histogram["interval"]
+		if !ok {
+			return nil, errors.New("histogram aggregation requires interval")
+		}
+		interval := float64(0)
+		switch value := intervalValue.(type) {
+		case json.Number:
+			if parsed, err := value.Float64(); err == nil {
+				interval = parsed
+			}
+		case float64:
+			interval = value
+		case int:
+			interval = float64(value)
+		case int64:
+			interval = float64(value)
+		}
+		if interval <= 0 {
+			return nil, errors.New("histogram aggregation requires positive interval")
+		}
+		sql := fmt.Sprintf(`
+			SELECT (floor((document ->> '%s')::numeric / %g) * %g)::numeric AS key, COUNT(*)::int AS doc_count
+			FROM %s
+			%s
+			GROUP BY key
+			ORDER BY key ASC
+		`, field, interval, interval, tableName, whereClause)
+		return &aggQuery{Name: name, SQL: sql, Type: "histogram"}, nil
 	}
 
 	if histogram, ok := aggBody["date_histogram"].(map[string]any); ok {
