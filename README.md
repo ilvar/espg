@@ -78,3 +78,7 @@ Supports basic queries with `term`, `match`, `range`, and `bool.must`, plus `fro
 Supported aggregations:
 - `terms` → `GROUP BY document ->> field`
 - `date_histogram` → `date_trunc(interval, (document ->> field)::timestamptz)`
+
+### Future work / TODO
+- Pass through selected indices (for example, an allowlist like `logs-*` or `metrics-*`) to a real Elasticsearch cluster while keeping the rest backed by Postgres.
+- Automatically create indices when slow queries or aggregations are detected (for example, track query latency and trigger index creation when it consistently exceeds a threshold like 500ms for a given index/field).
