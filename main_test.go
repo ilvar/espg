@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
@@ -88,7 +89,11 @@ func (m *mockPool) QueryRow(ctx context.Context, sql string, args ...any) pgx.Ro
 
 func setupApp(pool dbPool) *fiber.App {
 	app := fiber.New()
-	srv := &server{pool: pool}
+	srv := &server{
+		pool:       pool,
+		indexStore: newIndexStore(),
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+	}
 	srv.registerRoutes(app)
 	return app
 }
