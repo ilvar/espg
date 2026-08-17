@@ -37,11 +37,19 @@ jobs:
           rm -f go.mod integration_test.go main.go main_test.go
           python3 - <<'PY'
           from pathlib import Path
-          path = Path('src/app.rs')
-          source = path.read_text()
+
+          app = Path('src/app.rs')
+          source = app.read_text()
           source = source.replace('let params: [&(dyn ToSql + Sync); 2] = [id, &value];', 'let params: [&(dyn ToSql + Sync); 2] = [&id, &value];')
           source = source.replace('let params: [&(dyn ToSql + Sync); 2] = [id, &document];', 'let params: [&(dyn ToSql + Sync); 2] = [&id, &document];')
-          path.write_text(source)
+          source = source.replace('fn validate_index(index: &str) -> Result<(), Response> {', '#[allow(clippy::result_large_err)]\nfn validate_index(index: &str) -> Result<(), Response> {')
+          source = source.replace('fn parse_required_document(body: &[u8]) -> Result<Map<String, Value>, Response> {', '#[allow(clippy::result_large_err)]\nfn parse_required_document(body: &[u8]) -> Result<Map<String, Value>, Response> {')
+          source = source.replace('fn parse_optional_object(body: &[u8]) -> Result<Map<String, Value>, Response> {', '#[allow(clippy::result_large_err)]\nfn parse_optional_object(body: &[u8]) -> Result<Map<String, Value>, Response> {')
+          app.write_text(source)
+
+          query = Path('src/query.rs')
+          source = query.read_text().replace('if lines.len() % 2 != 0 {', 'if !lines.len().is_multiple_of(2) {')
+          query.write_text(source)
           PY
           rm -f .github/workflows/bootstrap-rust-rewrite.yml .github/workflows/bootstrap-rust-fix.yml
       - name: Format
