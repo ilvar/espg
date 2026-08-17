@@ -1,32 +1,70 @@
 # espg
+
 What if Postgres pretends to be Elasticsearch?
 
-## Service overview
-This repository provides a minimal HTTP service that maps Elasticsearch-like APIs onto Postgres tables.
-The service is implemented in Go with Fiber and `pgx`.
+`espg` is a small Elasticsearch-compatible HTTP facade backed by PostgreSQL `JSONB`. The service is written in Rust with Axum, Tokio, `tokio-postgres`, `deadpool-postgres`, and `reqwest`, and is kept inside the [`strictrs`](https://github.com/ilvar/strictrs) Rust subset.
 
-### Configuration
-The service uses standard Postgres environment variables or a `DATABASE_URL`:
+The goal is compatibility with a useful Elasticsearch subset, not a full Elasticsearch reimplementation.
+
+## Architecture
+
+Request handling is split into a few explicit modules:
+
+- `src/main.rs` — process startup plus the `strictrs` capability boundary used to bind the HTTP listener.
+- `src/config.rs` — environment-driven PostgreSQL, pool, HTTP, and passthrough configuration.
+- `src/app.rs` — Axum routes, PostgreSQL operations, index metadata, Elasticsearch-compatible responses, and passthrough handling.
+- `src/query.rs` — query/sort/aggregation translation and NDJSON parsing for bulk/msearch requests.
+
+Each local Elasticsearch index maps to one PostgreSQL table. Documents are stored as `JSONB`; supported Elasticsearch queries are translated into parameterized PostgreSQL SQL. Index and field identifiers that are inserted into SQL are validated before use.
+
+Mappings and settings are compatibility metadata held in memory. They do **not** survive a process restart; stored documents do.
+
+## Configuration
+
+PostgreSQL can be configured with `DATABASE_URL` or the standard PG environment variables:
 
 - `DATABASE_URL`
-- `PGHOST`
-- `PGPORT`
-- `PGUSER`
+- `PGHOST` (default `localhost`)
+- `PGPORT` (default `5432`)
+- `PGUSER` (default `postgres`)
 - `PGPASSWORD`
-- `PGDATABASE`
-- `PGPOOL_SIZE`
+- `PGDATABASE` (default `postgres`)
+- `PGPOOL_SIZE` (default `10`)
 - `PORT` (HTTP port, default `3000`)
 
-### Running locally
+Optional Elasticsearch passthrough:
+
+- `PASSTHROUGH_URL` — base URL of a real Elasticsearch cluster.
+- `PASSTHROUGH_INDICES` — comma-separated index patterns with `*` wildcards.
+
+Example:
+
 ```bash
-go run .
+PASSTHROUGH_URL=https://elasticsearch.example.internal:9200
+PASSTHROUGH_INDICES=logs-*,metrics-*
 ```
 
-### Framework choice (2026 snapshot)
-Fiber remains a fast, battle-tested choice for high-throughput JSON APIs in 2026, so this service uses it as the default HTTP layer. If you want to compare alternatives, other modern Go options include Gin, Echo, and Chi with the standard `net/http` stack.
+Cluster/admin passthrough endpoints use `PASSTHROUGH_URL`. Index-specific fallback is only used for indices matching `PASSTHROUGH_INDICES`.
 
-### Index schema
-Each index maps to a Postgres table created as:
+## Run
+
+The repository pins Rust **1.97.1** and commits `Cargo.lock`.
+
+```bash
+cargo run --locked
+```
+
+Or run the service and PostgreSQL with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+The HTTP service listens on port `3000` by default.
+
+## PostgreSQL schema
+
+Each local index maps to one PostgreSQL table:
 
 ```sql
 CREATE TABLE <index> (
@@ -36,62 +74,103 @@ CREATE TABLE <index> (
 );
 ```
 
-### Endpoints
-#### `PUT /:index`
-Creates a Postgres table for the index.
+Index names and JSON field names used in generated SQL follow this identifier contract:
 
-#### `DELETE /:index`
-Drops the Postgres table.
-
-#### `POST /:index/_bulk`
-Bulk insert/update. Accepts NDJSON payloads with `index` actions followed by documents:
-
-```
-{ "index": { "_id": "1" } }
-{ "title": "Hello" }
-{ "index": { "_id": "2" } }
-{ "title": "World" }
+```text
+[A-Za-z_][A-Za-z0-9_]*
 ```
 
-#### `POST /:index/_search`
-Supports basic queries with `term`, `match`, `range`, and `bool.must`, plus `from`/`size` pagination. Example:
+Query values are passed as PostgreSQL parameters rather than interpolated into SQL.
 
-```json
-{
-  "query": {
-    "bool": {
-      "must": [
-        { "term": { "status": "published" } },
-        { "range": { "published_at": { "gte": "2024-01-01" } } }
-      ]
-    }
-  },
-  "from": 0,
-  "size": 25,
-  "aggs": {
-    "by_author": { "terms": { "field": "author" } },
-    "by_day": { "date_histogram": { "field": "published_at", "calendar_interval": "day" } }
-  }
-}
-```
+## Implemented API surface
+
+### Cluster compatibility
+
+- `GET /`
+- `GET /_cluster/health`
+- passthrough when configured: `/_cluster/state`, `/_nodes`, `/_tasks`, `/_snapshot/*`, `/_ilm/*`, `/_security/*`, `/_alias`, `/_cat/*`
+
+### Index APIs
+
+- `HEAD /:index`
+- `GET /:index`
+- `PUT /:index`
+- `DELETE /:index`
+- `GET|PUT /:index/_mapping`
+- `GET|PUT /:index/_settings`
+
+### Document APIs
+
+- `POST /:index/_doc`
+- `GET|PUT|DELETE /:index/_doc/:id`
+- `POST /:index/_update/:id`
+- `POST /:index/_delete_by_query`
+- `POST /:index/_update_by_query`
+- `POST /:index/_bulk`
+- `POST /:index/_mget`
+- `POST /_mget`
+
+Bulk accepts Elasticsearch-style NDJSON `index` action/source pairs.
+
+### Search APIs
+
+- `POST /:index/_search`
+- `GET|POST /:index/_count`
+- `POST /:index/_msearch`
+- `POST /_msearch`
+
+Supported queries:
+
+- `term`
+- `match`
+- `terms`
+- `range` with `gte` / `lte`
+- `bool.must`
+- `bool.filter`
+- `bool.must_not`
+- `bool.should`
+
+Search also supports `from`, `size`, and basic field / `_id` sorting.
 
 Supported aggregations:
-- `terms` → `GROUP BY document ->> field`
-- `date_histogram` → `date_trunc(interval, (document ->> field)::timestamptz)`
 
-### Future work / TODO
-- Pass through selected indices (for example, an allowlist like `logs-*` or `metrics-*`) to a real Elasticsearch cluster while keeping the rest backed by Postgres.
-- Automatically create indices when slow queries or aggregations are detected (for example, track query latency and trigger index creation when it consistently exceeds a threshold like 500ms for a given index/field).
+- `terms`
+- `histogram`
+- `date_histogram`
+- `avg`
+- `min`
+- `max`
+- `sum`
+- `stats`
+- `cardinality`
 
-### Missing endpoints and query features
-Only the endpoints listed above are implemented. Every other Elasticsearch endpoint is currently missing, including (but not limited to):
-- Index management: `PUT /:index/_mapping`, `GET /:index/_mapping`, `PUT /:index/_settings`, `GET /:index/_settings`, `POST /:index/_aliases`, `GET /_alias`, `GET /_cat/*`.
-- Document APIs: `POST /:index/_update/:id`, `POST /:index/_update_by_query`, `POST /:index/_mget`, `POST /_mget`, `POST /:index/_msearch`, `POST /_msearch`.
-- Search/analytics: `GET /:index/_count`, `POST /:index/_search/scroll`, `POST /_search/scroll`, `POST /_pit`, `DELETE /_pit`, `POST /_search/template`.
-- Cluster/admin: `GET /_cluster/state`, `GET /_nodes`, `GET /_tasks`, `GET /_snapshot/*`, `GET /_ilm/*`, `GET /_security/*`.
+Unsupported Elasticsearch endpoints and DSL features are not silently emulated. Extend the subset deliberately and add focused compatibility tests when doing so.
 
-Missing query features (only `term`, `match`, `range` with `gte`/`lte`, and `bool.must` are supported today):
-- Boolean query clauses: `bool.filter`, `bool.should`, `bool.must_not`, `minimum_should_match`.
-- Additional query types: `terms`, `match_phrase`, `match_phrase_prefix`, `multi_match`, `query_string`, `simple_query_string`, `prefix`, `wildcard`, `regexp`, `fuzzy`, `ids`, `exists`, `nested`, `geo_*`.
-- Search options: `sort`, `search_after`, `track_total_hits`, `_source` filtering, `stored_fields`, `docvalue_fields`, `highlight`, `suggest`, `rescore`, `collapse`, `timeout`.
-- Aggregations beyond `terms`, `histogram`, and `date_histogram` (for example `avg`, `sum`, `min`, `max`, `stats`, `extended_stats`, `cardinality`, `filters`, `composite`, `significant_terms`, `top_hits`, `nested`).
+## Development and validation
+
+The CI baseline is:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+strictrs check .
+```
+
+Install `strictrs` directly from its source repository if needed:
+
+```bash
+cargo install --git https://github.com/ilvar/strictrs --locked
+```
+
+For changes affecting PostgreSQL behavior, HTTP routing, Docker packaging, or end-to-end semantics, also run:
+
+```bash
+./scripts/run-integration-tests.sh
+```
+
+That script uses Docker Compose and `curl` to build/start PostgreSQL and `espg`, check service readiness, create an index and document, and verify a search result.
+
+Production code follows the `strictrs` restrictions: no unsafe code, no panic APIs, no unchecked numeric casts, no wildcard imports, explicit handling of must-use values, and explicit capability boundaries for direct standard-library effects.
+
+See [`AGENTS.md`](AGENTS.md) for repository-specific rules for coding agents.

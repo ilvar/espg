@@ -1,17 +1,17 @@
-FROM golang:1.25-alpine AS build
+FROM rust:1.97.1-bookworm AS build
 
 WORKDIR /src
-COPY go.mod ./
-RUN go get espg
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -o /bin/espg .
+COPY Cargo.toml rust-toolchain.toml ./
+COPY src ./src
+RUN cargo build --release
 
-FROM alpine:3.20
-RUN adduser -D -g '' app
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 app
 USER app
-WORKDIR /home/app
-COPY --from=build /bin/espg /usr/local/bin/espg
+COPY --from=build /src/target/release/espg /usr/local/bin/espg
 EXPOSE 3000
 ENV PORT=3000
 ENTRYPOINT ["espg"]

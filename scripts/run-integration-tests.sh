@@ -1,29 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-compose_command=(docker compose)
-
-log() {
-  printf '\n==> %s\n' "$1"
-}
-
+compose=(docker compose)
 cleanup() {
-  log "Stopping containers"
-  "${compose_command[@]}" down -v
+  "${compose[@]}" down -v >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-log "Starting Postgres container"
-"${compose_command[@]}" up -d db
+"${compose[@]}" up -d --build
 
-log "Waiting for Postgres to be ready"
-for _ in {1..20}; do
-  if "${compose_command[@]}" exec -T db pg_isready -U postgres >/dev/null 2>&1; then
+for _ in {1..60}; do
+  if curl --fail --silent http://localhost:3000/ >/dev/null; then
     break
   fi
-  sleep 1
+  sleep 2
 done
 
-log "Running integration tests (go test -v -tags=integration ./...)"
-DATABASE_URL="postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable" \
-  go test -v -tags=integration ./...
+curl --fail --silent http://localhost:3000/ | grep -q '"name":"espg"'
+curl --fail --silent -X PUT http://localhost:3000/ci_books | grep -q '"acknowledged":true'
+curl --fail --silent -X PUT \
+  -H 'content-type: application/json' \
+  --data '{"title":"Hello","status":"published"}' \
+  http://localhost:3000/ci_books/_doc/1 | grep -Eq '"result":"created"|"result":"updated"'
+curl --fail --silent -X POST \
+  -H 'content-type: application/json' \
+  --data '{"query":{"term":{"status":"published"}}}' \
+  http://localhost:3000/ci_books/_search | grep -q '"total":1'
