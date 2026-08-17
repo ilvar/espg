@@ -1,0 +1,28 @@
+[package]
+name = "espg"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.97.1"
+publish = false
+
+[dependencies]
+axum = "0.8"
+deadpool-postgres = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+as_conversions = "deny"
+wildcard_imports = "deny"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
