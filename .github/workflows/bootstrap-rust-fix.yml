@@ -60,7 +60,7 @@ jobs:
           source = source.replace('mod capability {\n    use axum::Router;', 'mod capability {\n    pub use std::process::ExitCode;\n\n    use axum::Router;')
           main.write_text(source)
           PY
-          rm -f .github/workflows/bootstrap-rust-rewrite.yml .github/workflows/bootstrap-rust-fix.yml
+          rm -f .github/workflows/ci.yml
       - name: Format
         run: cargo +1.97.1 fmt
       - name: Clippy
