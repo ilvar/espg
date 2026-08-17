@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "agent/**"]
+  pull_request:
+
+concurrency:
+  group: espg-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+      - name: Format
+        run: cargo +1.97.1 fmt --check
+      - name: Clippy
+        run: cargo +1.97.1 clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo +1.97.1 test --all-targets --all-features
+      - name: Install strictrs
+        run: cargo +1.97.1 install --git https://github.com/ilvar/strictrs --locked
+      - name: Strict Rust check
+        run: strictrs check .
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Integration smoke test
+        run: ./scripts/run-integration-tests.sh
