@@ -1,8 +1,9 @@
 use crate::config::Config;
 use crate::mapping::{
-    column_definitions, elasticsearch_type, index_statements, json_from_text,
-    merge_mapping_properties, param_expression, parse_mapping_properties, postgres_type,
-    read_expression, FieldTypes, SOURCE_COLUMN_PREFIX,
+    column_definitions, elasticsearch_type, index_name, index_spec, index_statements,
+    json_from_text, merge_mapping_properties, param_expression, parse_mapping_properties,
+    postgres_type, read_expression, requires_trigram, FieldTypes, SOURCE_COLUMN_PREFIX,
+    TRIGRAM_EXTENSION,
 };
 use crate::query::{
     assert_identifier, build_search_plan, build_where_clause, match_pattern, parse_bulk,
@@ -291,9 +292,79 @@ async fn ensure_columns(
             .await
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
     }
+    if requires_trigram(properties) {
+        let sql = format!("CREATE EXTENSION IF NOT EXISTS {TRIGRAM_EXTENSION}");
+        client.execute(&sql, &[]).await.map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "a text field needs the {TRIGRAM_EXTENSION} extension, which could not be \
+                     installed: {}",
+                    write_error(&error)
+                ),
+            )
+        })?;
+    }
+    // A field remapped between types that share a column keeps its column but
+    // may need a different index; drop the stale one so it is rebuilt below.
+    drop_mismatched_indexes(client, index, properties).await?;
     // Indexed after the columns exist, so this covers both a fresh table and a
     // mapping update that added fields.
     for sql in index_statements(index, properties) {
+        client
+            .execute(&sql, &[])
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Drop any existing index whose access method no longer matches the mapping.
+///
+/// `CREATE INDEX IF NOT EXISTS` keeps whatever is already there, so without this
+/// a `keyword` field promoted to `text` would keep its btree and stay subject to
+/// the btree size limit the trigram index exists to avoid.
+async fn drop_mismatched_indexes(
+    client: &Object,
+    index: &str,
+    properties: &Map<String, Value>,
+) -> Result<(), Response> {
+    let rows = client
+        .query(
+            "SELECT i.relname, am.amname FROM pg_class i \
+             JOIN pg_index x ON x.indexrelid = i.oid \
+             JOIN pg_class t ON t.oid = x.indrelid \
+             JOIN pg_am am ON am.oid = i.relam \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             WHERE n.nspname = 'public' AND t.relname = $1",
+            &[&index],
+        )
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    let mut existing = BTreeMap::new();
+    for row in rows {
+        let name = row
+            .try_get::<_, String>(0)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+        let method = row
+            .try_get::<_, String>(1)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+        let _ = existing.insert(name, method);
+    }
+
+    for (field, definition) in properties {
+        let field_type = definition
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("object");
+        let name = index_name(index, field);
+        let Some(current) = existing.get(&name) else {
+            continue;
+        };
+        if current.eq_ignore_ascii_case(index_spec(field_type).method) {
+            continue;
+        }
+        let sql = format!("DROP INDEX IF EXISTS {}", quote_identifier(&name));
         client
             .execute(&sql, &[])
             .await

@@ -229,20 +229,56 @@ fn validate_field(field: &str, definition: &Value) -> Result<Map<String, Value>,
     Ok(object.clone())
 }
 
-/// Index method for a mapped column.
+/// Operator class enabling trigram matching on a `text` column.
+const TRIGRAM_OPERATOR_CLASS: &str = "gin_trgm_ops";
+
+/// PostgreSQL extension providing [`TRIGRAM_OPERATOR_CLASS`].
+pub const TRIGRAM_EXTENSION: &str = "pg_trgm";
+
+/// How a mapped column is indexed.
+pub struct IndexSpec {
+    pub method: &'static str,
+    pub operator_class: Option<&'static str>,
+}
+
+/// The index to build for a mapped column.
 ///
-/// `JSONB` columns get GIN: a btree over `jsonb` would refuse rows whose value
-/// exceeds the btree tuple limit, turning a large document into a write error.
-/// Everything else gets btree, which serves equality, ranges, and ordering.
-pub fn index_method(field_type: &str) -> &'static str {
-    match postgres_type(field_type) {
-        Some("JSONB") => "GIN",
-        _ => "BTREE",
+/// `text` is Elasticsearch's prose type, and `match` on it compiles to
+/// `ILIKE '%...%'`, which a btree cannot serve at all — and a btree entry is
+/// capped at 2704 bytes, so long prose would fail on write. A trigram GIN index
+/// serves that `ILIKE` and has no such cap.
+///
+/// `keyword`, `ip`, and `binary` share the `TEXT` column type but hold short
+/// exact-match values, so they keep btree: trigram GIN supports neither `=` nor
+/// `ORDER BY`. `JSONB` takes plain GIN for the same size reason as `text`.
+pub fn index_spec(field_type: &str) -> IndexSpec {
+    match field_type {
+        "text" => IndexSpec {
+            method: "GIN",
+            operator_class: Some(TRIGRAM_OPERATOR_CLASS),
+        },
+        _ => match postgres_type(field_type) {
+            Some("JSONB") => IndexSpec {
+                method: "GIN",
+                operator_class: None,
+            },
+            _ => IndexSpec {
+                method: "BTREE",
+                operator_class: None,
+            },
+        },
     }
 }
 
+/// Whether any mapped field needs the trigram extension installed.
+pub fn requires_trigram(properties: &Map<String, Value>) -> bool {
+    properties
+        .values()
+        .any(|definition| index_spec(field_type(definition)).operator_class.is_some())
+}
+
 /// Index name for a mapped column, clamped to PostgreSQL's identifier limit.
-fn index_name(index: &str, field: &str) -> String {
+pub fn index_name(index: &str, field: &str) -> String {
     let name = format!("{index}_{field}_idx");
     match name.char_indices().nth(MAX_IDENTIFIER_LENGTH) {
         Some((cutoff, _)) => name.get(..cutoff).unwrap_or(&name).to_owned(),
@@ -259,11 +295,17 @@ pub fn index_statements(index: &str, properties: &Map<String, Value>) -> Vec<Str
         if postgres_type(field_type).is_none() {
             continue;
         }
-        let method = index_method(field_type);
+        let spec = index_spec(field_type);
+        let method = spec.method;
+        let column = match spec.operator_class {
+            Some(operator_class) => {
+                format!("{} {operator_class}", crate::query::quote_identifier(field))
+            }
+            None => crate::query::quote_identifier(field),
+        };
         statements.push(format!(
-            "CREATE INDEX IF NOT EXISTS {} ON {table} USING {method} ({})",
-            crate::query::quote_identifier(&index_name(index, field)),
-            crate::query::quote_identifier(field)
+            "CREATE INDEX IF NOT EXISTS {} ON {table} USING {method} ({column})",
+            crate::query::quote_identifier(&index_name(index, field))
         ));
     }
     statements
@@ -415,9 +457,37 @@ mod tests {
         assert!(statements.contains(&String::from(
             r#"CREATE INDEX IF NOT EXISTS "books_views_idx" ON "books" USING BTREE ("views")"#
         )));
+        // Prose takes a trigram GIN: it serves the ILIKE that `match` compiles
+        // to, and has no btree tuple-size limit.
+        assert!(statements.contains(&String::from(
+            r#"CREATE INDEX IF NOT EXISTS "books_title_idx" ON "books" USING GIN ("title" gin_trgm_ops)"#
+        )));
         // jsonb takes GIN; a btree would reject oversized values on write.
         assert!(statements.contains(&String::from(
             r#"CREATE INDEX IF NOT EXISTS "books_meta_idx" ON "books" USING GIN ("meta")"#
+        )));
+    }
+
+    #[test]
+    fn keyword_keeps_btree_while_text_takes_trigram() {
+        // Both are TEXT columns, but only `text` needs trigram matching;
+        // trigram GIN supports neither `=` nor ORDER BY, which keyword wants.
+        assert_eq!(super::index_spec("keyword").method, "BTREE");
+        assert_eq!(super::index_spec("ip").method, "BTREE");
+        assert_eq!(super::index_spec("text").method, "GIN");
+        assert_eq!(
+            super::index_spec("text").operator_class,
+            Some("gin_trgm_ops")
+        );
+    }
+
+    #[test]
+    fn only_text_fields_require_the_trigram_extension() {
+        assert!(super::requires_trigram(&properties(
+            json!({"title": {"type": "text"}})
+        )));
+        assert!(!super::requires_trigram(&properties(
+            json!({"tag": {"type": "keyword"}, "views": {"type": "long"}})
         )));
     }
 

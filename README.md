@@ -121,9 +121,19 @@ Elasticsearch field types map to column types as follows:
 | `date` | `TIMESTAMP WITH TIME ZONE` |
 | `object`, `geo_point` | `JSONB` |
 
-Every mapped column is indexed: btree for the scalar types, GIN for `JSONB`. Indexes are created alongside the column, so fields added later via `PUT /:index/_mapping` are indexed too.
+Every mapped column is indexed, alongside the column itself, so fields added later via `PUT /:index/_mapping` are indexed too:
 
-> **Size limit on indexed text.** A btree entry cannot exceed 2704 bytes, so writing a `text`/`keyword` value larger than that (after compression) is rejected with `400 index row size ... exceeds btree version 4 maximum`. Highly compressible values are fine well past that size. If an index needs to hold long prose in a mapped field, leave the field out of the mapping so it stays in the residual `document` JSONB.
+| Elasticsearch type | Index |
+| --- | --- |
+| `text` | GIN with `gin_trgm_ops` |
+| `object`, `geo_point` | GIN |
+| everything else | btree |
+
+`text` is the prose type, and `match` on it compiles to `ILIKE '%...%'`, which a btree cannot serve — a trigram GIN can, and it has no btree size limit. `keyword`, `ip`, and `binary` share the `TEXT` column but keep btree, because trigram GIN supports neither `=` nor `ORDER BY`.
+
+Mapping a `text` field therefore requires the **`pg_trgm`** extension. espg runs `CREATE EXTENSION IF NOT EXISTS pg_trgm` when a mapping first needs it; if the database user is not permitted to install it, the request fails with a message naming the extension.
+
+> **Size limit on btree-indexed columns.** A btree entry cannot exceed 2704 bytes, so writing a `keyword`, `ip`, or `binary` value larger than that (after compression) is rejected with `400 index row size ... exceeds btree version 4 maximum`. Highly compressible values are fine well past that size. Map the field as `text` if it needs to hold long values.
 
 Index names and JSON field names used in generated SQL follow this identifier contract:
 
