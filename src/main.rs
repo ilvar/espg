@@ -5,6 +5,7 @@
 
 mod app;
 mod config;
+mod mapping;
 mod query;
 
 use config::Config;

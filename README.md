@@ -17,7 +17,38 @@ Request handling is split into a few explicit modules:
 
 Each local Elasticsearch index maps to one PostgreSQL table. Documents are stored as `JSONB`; supported Elasticsearch queries are translated into parameterized PostgreSQL SQL. Index and field identifiers that are inserted into SQL are validated before use.
 
-Mappings and settings are compatibility metadata held in memory. They do **not** survive a process restart; stored documents do.
+Mapped fields are stored in real typed PostgreSQL columns. Anything not in the mapping — including dynamic fields — stays in a residual `document` JSONB column, and `_source` is reassembled from both on read.
+
+Because mapped fields are real columns, `range`, `sort`, and aggregations on them use PostgreSQL's own types. Unmapped fields are still compared as text out of JSONB, so numeric ranges and sorts on them remain lexicographic (`"10" < "9"`); map a field to get correct numeric ordering.
+
+Settings are compatibility metadata held in memory and do **not** survive a restart. The mapping does survive: it is rebuilt from the table's columns, since the PostgreSQL catalog is the source of truth for which fields are columns.
+
+### Mappings
+
+`PUT /:index` accepts `mappings` and `settings` in the request body, and `PUT /:index/_mapping` adds fields to an existing index:
+
+```bash
+curl -XPUT localhost:3000/books -H 'Content-Type: application/json' -d '{
+  "mappings": {"properties": {"title": {"type": "text"}, "views": {"type": "long"}}},
+  "settings": {"index": {"number_of_shards": 1}}
+}'
+
+curl -XPUT localhost:3000/books/_mapping -H 'Content-Type: application/json' -d '{
+  "properties": {"published_at": {"type": "date"}}
+}'
+```
+
+Mapping rules:
+
+- Field names must satisfy `[A-Za-z_][A-Za-z0-9_]*`, the same contract as index names, and may not start with the reserved prefix `_espg_col_`.
+- Each field definition must be an object with a `type` of `binary`, `boolean`, `byte`, `date`, `double`, `float`, `geo_point`, `half_float`, `integer`, `ip`, `keyword`, `long`, `object`, `short`, or `text`. Other keys on the definition (such as `format`) are stored and returned unchanged.
+- Subfields are **not** supported: a field definition containing `properties` or `fields` is rejected with `400`.
+- `PUT /:index/_mapping` merges into the existing mapping and adds a column for each new field. Adding a field or repeating an identical definition succeeds; changing the type of an existing field is rejected with `400`, since the column type would have to change under existing data. Changes that keep the same column type (`keyword` to `text`) are allowed.
+- Values are converted by PostgreSQL when written. A value that will not convert (`"abc"` into a `long`) is rejected with `400`.
+- A `date` field is stored as `timestamptz` and rendered back in `_source` as `YYYY-MM-DDTHH:MM:SS.mmmZ`, so the exact input string is not necessarily preserved.
+- After a restart the mapping is rebuilt from the columns, which reports the representative type for a shared column type — a `text` field reads back as `keyword`, and `ip`/`binary` read back as `keyword`.
+- The body may either wrap fields in `properties` or list them directly. In the direct form, mapping-level keys (`_meta`, `_source`, `date_detection`, `dynamic`, `dynamic_templates`, `numeric_detection`, `runtime`) are accepted and ignored; a field sharing one of those names must be sent inside `properties`.
+- `settings` is accepted both as `{"settings": {"index": {...}}}` and as a bare `{"settings": {...}}`.
 
 ## Configuration
 
@@ -64,15 +95,45 @@ The HTTP service listens on port `3000` by default.
 
 ## PostgreSQL schema
 
-Each local index maps to one PostgreSQL table:
+Each local index maps to one PostgreSQL table, with one typed column per mapped field:
 
 ```sql
 CREATE TABLE <index> (
   id TEXT PRIMARY KEY,
-  document JSONB NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  document JSONB NOT NULL,          -- unmapped and dynamic fields
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  title TEXT,                       -- from {"title": {"type": "text"}}
+  views BIGINT                      -- from {"views": {"type": "long"}}
 );
 ```
+
+Elasticsearch field types map to column types as follows:
+
+| Elasticsearch | PostgreSQL |
+| --- | --- |
+| `text`, `keyword`, `ip`, `binary` | `TEXT` |
+| `long` | `BIGINT` |
+| `integer` | `INTEGER` |
+| `short`, `byte` | `SMALLINT` |
+| `double` | `DOUBLE PRECISION` |
+| `float`, `half_float` | `REAL` |
+| `boolean` | `BOOLEAN` |
+| `date` | `TIMESTAMP WITH TIME ZONE` |
+| `object`, `geo_point` | `JSONB` |
+
+Every mapped column is indexed, alongside the column itself, so fields added later via `PUT /:index/_mapping` are indexed too:
+
+| Elasticsearch type | Index |
+| --- | --- |
+| `text` | GIN with `gin_trgm_ops` |
+| `object`, `geo_point` | GIN |
+| everything else | btree |
+
+`text` is the prose type, and `match` on it compiles to `ILIKE '%...%'`, which a btree cannot serve — a trigram GIN can, and it has no btree size limit. `keyword`, `ip`, and `binary` share the `TEXT` column but keep btree, because trigram GIN supports neither `=` nor `ORDER BY`.
+
+Mapping a `text` field therefore requires the **`pg_trgm`** extension. espg runs `CREATE EXTENSION IF NOT EXISTS pg_trgm` when a mapping first needs it; if the database user is not permitted to install it, the request fails with a message naming the extension.
+
+> **Size limit on btree-indexed columns.** A btree entry cannot exceed 2704 bytes, so writing a `keyword`, `ip`, or `binary` value larger than that (after compression) is rejected with `400 index row size ... exceeds btree version 4 maximum`. Highly compressible values are fine well past that size. Map the field as `text` if it needs to hold long values.
 
 Index names and JSON field names used in generated SQL follow this identifier contract:
 

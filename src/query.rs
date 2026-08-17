@@ -1,3 +1,4 @@
+use crate::mapping::{param_expression, read_expression, FieldTypes};
 use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,13 +46,14 @@ pub struct BulkOperation {
 pub fn build_search_plan(
     body: &Map<String, Value>,
     table_name: &str,
+    types: &FieldTypes,
 ) -> Result<SearchPlan, String> {
     let mut values = Vec::new();
-    let where_clause = build_where_clause(body.get("query"), &mut values)?;
-    let sort_clause = build_sort_clause(body.get("sort"))?;
+    let where_clause = build_where_clause(body.get("query"), &mut values, types)?;
+    let sort_clause = build_sort_clause(body.get("sort"), types)?;
     let size = to_i64(body.get("size"), 10);
     let from = to_i64(body.get("from"), 0);
-    let aggregation = build_aggregation(body, table_name, &where_clause)?;
+    let aggregation = build_aggregation(body, table_name, &where_clause, types)?;
 
     Ok(SearchPlan {
         where_clause,
@@ -66,8 +68,9 @@ pub fn build_search_plan(
 pub fn build_where_clause(
     query: Option<&Value>,
     values: &mut Vec<String>,
+    types: &FieldTypes,
 ) -> Result<String, String> {
-    let clause = build_query_clause(query, values)?;
+    let clause = build_query_clause(query, values, types)?;
     if clause.is_empty() {
         Ok(String::new())
     } else {
@@ -75,7 +78,11 @@ pub fn build_where_clause(
     }
 }
 
-fn build_query_clause(query: Option<&Value>, values: &mut Vec<String>) -> Result<String, String> {
+fn build_query_clause(
+    query: Option<&Value>,
+    values: &mut Vec<String>,
+    types: &FieldTypes,
+) -> Result<String, String> {
     let Some(query_map) = query.and_then(Value::as_object) else {
         return Ok(String::new());
     };
@@ -87,7 +94,11 @@ fn build_query_clause(query: Option<&Value>, values: &mut Vec<String>) -> Result
         if let Some((field, value)) = term.iter().next() {
             assert_identifier(field, "term field")?;
             values.push(value_to_string(value));
-            return Ok(format!("document ->> '{field}' = ${}", values.len()));
+            return Ok(format!(
+                "{} = {}",
+                field_expression(field, types),
+                field_param(field, types, values.len())
+            ));
         }
     }
 
@@ -95,7 +106,11 @@ fn build_query_clause(query: Option<&Value>, values: &mut Vec<String>) -> Result
         if let Some((field, value)) = match_query.iter().next() {
             assert_identifier(field, "match field")?;
             values.push(format!("%{}%", value_to_string(value)));
-            return Ok(format!("document ->> '{field}' ILIKE ${}", values.len()));
+            return Ok(format!(
+                "{} ILIKE ${}",
+                field_text_expression(field, types),
+                values.len()
+            ));
         }
     }
 
@@ -108,13 +123,14 @@ fn build_query_clause(query: Option<&Value>, values: &mut Vec<String>) -> Result
             let mut placeholders = Vec::new();
             for item in list {
                 values.push(value_to_string(item));
-                placeholders.push(format!("${}", values.len()));
+                placeholders.push(field_param(field, types, values.len()));
             }
             if placeholders.is_empty() {
                 return Ok(String::new());
             }
             return Ok(format!(
-                "document ->> '{field}' IN ({})",
+                "{} IN ({})",
+                field_expression(field, types),
                 placeholders.join(", ")
             ));
         }
@@ -129,11 +145,19 @@ fn build_query_clause(query: Option<&Value>, values: &mut Vec<String>) -> Result
             let mut clauses = Vec::new();
             if let Some(gte) = constraints.get("gte") {
                 values.push(value_to_string(gte));
-                clauses.push(format!("document ->> '{field}' >= ${}", values.len()));
+                clauses.push(format!(
+                    "{} >= {}",
+                    field_expression(field, types),
+                    field_param(field, types, values.len())
+                ));
             }
             if let Some(lte) = constraints.get("lte") {
                 values.push(value_to_string(lte));
-                clauses.push(format!("document ->> '{field}' <= ${}", values.len()));
+                clauses.push(format!(
+                    "{} <= {}",
+                    field_expression(field, types),
+                    field_param(field, types, values.len())
+                ));
             }
             if !clauses.is_empty() {
                 return Ok(clauses.join(" AND "));
@@ -143,14 +167,20 @@ fn build_query_clause(query: Option<&Value>, values: &mut Vec<String>) -> Result
 
     if let Some(bool_query) = query_map.get("bool").and_then(Value::as_object) {
         let mut clauses = Vec::new();
-        append_boolean_clauses(bool_query.get("must"), values, false, &mut clauses)?;
-        append_boolean_clauses(bool_query.get("filter"), values, false, &mut clauses)?;
-        append_boolean_clauses(bool_query.get("must_not"), values, true, &mut clauses)?;
+        append_boolean_clauses(bool_query.get("must"), values, false, &mut clauses, types)?;
+        append_boolean_clauses(bool_query.get("filter"), values, false, &mut clauses, types)?;
+        append_boolean_clauses(
+            bool_query.get("must_not"),
+            values,
+            true,
+            &mut clauses,
+            types,
+        )?;
 
         if let Some(should) = bool_query.get("should").and_then(Value::as_array) {
             let mut should_clauses = Vec::new();
             for condition in should {
-                let clause = build_query_clause(Some(condition), values)?;
+                let clause = build_query_clause(Some(condition), values, types)?;
                 if !clause.is_empty() {
                     should_clauses.push(clause);
                 }
@@ -173,12 +203,13 @@ fn append_boolean_clauses(
     values: &mut Vec<String>,
     negate: bool,
     clauses: &mut Vec<String>,
+    types: &FieldTypes,
 ) -> Result<(), String> {
     let Some(items) = value.and_then(Value::as_array) else {
         return Ok(());
     };
     for condition in items {
-        let clause = build_query_clause(Some(condition), values)?;
+        let clause = build_query_clause(Some(condition), values, types)?;
         if clause.is_empty() {
             continue;
         }
@@ -191,7 +222,7 @@ fn append_boolean_clauses(
     Ok(())
 }
 
-pub fn build_sort_clause(sort: Option<&Value>) -> Result<String, String> {
+pub fn build_sort_clause(sort: Option<&Value>, types: &FieldTypes) -> Result<String, String> {
     let Some(sort) = sort else {
         return Ok("ORDER BY created_at DESC".to_owned());
     };
@@ -200,7 +231,7 @@ pub fn build_sort_clause(sort: Option<&Value>) -> Result<String, String> {
     match sort {
         Value::Array(entries) => {
             for entry in entries {
-                let clause = parse_sort_entry(entry)?;
+                let clause = parse_sort_entry(entry, types)?;
                 if !clause.is_empty() {
                     parts.push(clause);
                 }
@@ -208,15 +239,17 @@ pub fn build_sort_clause(sort: Option<&Value>) -> Result<String, String> {
         }
         Value::Object(entries) => {
             for (field, direction) in entries {
-                let clause = parse_sort_field(field, direction)?;
+                let clause = parse_sort_field(field, direction, types)?;
                 if !clause.is_empty() {
                     parts.push(clause);
                 }
             }
         }
-        Value::String(field) => {
-            parts.push(parse_sort_field(field, &Value::String("asc".to_owned()))?)
-        }
+        Value::String(field) => parts.push(parse_sort_field(
+            field,
+            &Value::String("asc".to_owned()),
+            types,
+        )?),
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 
@@ -227,20 +260,20 @@ pub fn build_sort_clause(sort: Option<&Value>) -> Result<String, String> {
     }
 }
 
-fn parse_sort_entry(entry: &Value) -> Result<String, String> {
+fn parse_sort_entry(entry: &Value, types: &FieldTypes) -> Result<String, String> {
     match entry {
-        Value::String(field) => parse_sort_field(field, &Value::String("asc".to_owned())),
+        Value::String(field) => parse_sort_field(field, &Value::String("asc".to_owned()), types),
         Value::Object(entries) => {
             let Some((field, direction)) = entries.iter().next() else {
                 return Ok(String::new());
             };
-            parse_sort_field(field, direction)
+            parse_sort_field(field, direction, types)
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => Ok(String::new()),
     }
 }
 
-fn parse_sort_field(field: &str, direction: &Value) -> Result<String, String> {
+fn parse_sort_field(field: &str, direction: &Value, types: &FieldTypes) -> Result<String, String> {
     let order = match direction {
         Value::String(value) if value.eq_ignore_ascii_case("desc") => "DESC",
         Value::Object(options)
@@ -263,13 +296,14 @@ fn parse_sort_field(field: &str, direction: &Value) -> Result<String, String> {
         return Ok(format!("id {order}"));
     }
     assert_identifier(field, "sort field")?;
-    Ok(format!("document ->> '{field}' {order}"))
+    Ok(format!("{} {order}", field_expression(field, types)))
 }
 
 fn build_aggregation(
     body: &Map<String, Value>,
     table_name: &str,
     where_clause: &str,
+    types: &FieldTypes,
 ) -> Result<Option<Aggregation>, String> {
     let Some(aggs) = body
         .get("aggs")
@@ -288,8 +322,9 @@ fn build_aggregation(
     if let Some(terms) = agg_body.get("terms").and_then(Value::as_object) {
         let field = required_field(terms, "terms aggregation")?;
         let limit = to_i64(terms.get("size"), 10);
+        let key_expression = field_text_expression(&field, types);
         let sql = format!(
-            "SELECT document ->> '{field}' AS key, COUNT(*)::bigint AS doc_count FROM {table_name} {where_clause} GROUP BY key ORDER BY doc_count DESC LIMIT {limit}"
+            "SELECT {key_expression} AS key, COUNT(*)::bigint AS doc_count FROM {table_name} {where_clause} GROUP BY key ORDER BY doc_count DESC LIMIT {limit}"
         );
         return Ok(Some(Aggregation {
             name: name.clone(),
@@ -307,8 +342,9 @@ fn build_aggregation(
         if interval <= 0.0 {
             return Err("histogram aggregation requires positive interval".to_owned());
         }
+        let numeric = field_numeric_expression(&field, types);
         let sql = format!(
-            "SELECT (floor((document ->> '{field}')::double precision / {interval}) * {interval})::double precision AS key, COUNT(*)::bigint AS doc_count FROM {table_name} {where_clause} GROUP BY key ORDER BY key ASC"
+            "SELECT (floor({numeric} / {interval}) * {interval})::double precision AS key, COUNT(*)::bigint AS doc_count FROM {table_name} {where_clause} GROUP BY key ORDER BY key ASC"
         );
         return Ok(Some(Aggregation {
             name: name.clone(),
@@ -329,8 +365,9 @@ fn build_aggregation(
         ) {
             return Err("unsupported calendar_interval".to_owned());
         }
+        let timestamp = field_timestamp_expression(&field, types);
         let sql = format!(
-            r#"SELECT (EXTRACT(EPOCH FROM date_trunc('{interval}', (document ->> '{field}')::timestamptz)) * 1000)::double precision AS key, to_char(date_trunc('{interval}', (document ->> '{field}')::timestamptz) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS key_as_string, COUNT(*)::bigint AS doc_count FROM {table_name} {where_clause} GROUP BY 1, 2 ORDER BY 1 ASC"#
+            r#"SELECT (EXTRACT(EPOCH FROM date_trunc('{interval}', {timestamp})) * 1000)::double precision AS key, to_char(date_trunc('{interval}', {timestamp}) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS key_as_string, COUNT(*)::bigint AS doc_count FROM {table_name} {where_clause} GROUP BY 1, 2 ORDER BY 1 ASC"#
         );
         return Ok(Some(Aggregation {
             name: name.clone(),
@@ -347,8 +384,9 @@ fn build_aggregation(
     ] {
         if let Some(metric) = agg_body.get(key).and_then(Value::as_object) {
             let field = required_field(metric, &format!("{key} aggregation"))?;
+            let numeric = field_numeric_expression(&field, types);
             let sql = format!(
-                "SELECT {sql_fn}((document ->> '{field}')::double precision)::double precision AS value FROM {table_name} {where_clause}"
+                "SELECT {sql_fn}({numeric})::double precision AS value FROM {table_name} {where_clause}"
             );
             return Ok(Some(Aggregation {
                 name: name.clone(),
@@ -360,8 +398,10 @@ fn build_aggregation(
 
     if let Some(stats) = agg_body.get("stats").and_then(Value::as_object) {
         let field = required_field(stats, "stats aggregation")?;
+        let numeric = field_numeric_expression(&field, types);
+        let text = field_text_expression(&field, types);
         let sql = format!(
-            "SELECT COUNT(document ->> '{field}')::bigint AS count, MIN((document ->> '{field}')::double precision)::double precision AS min, MAX((document ->> '{field}')::double precision)::double precision AS max, AVG((document ->> '{field}')::double precision)::double precision AS avg, SUM((document ->> '{field}')::double precision)::double precision AS sum FROM {table_name} {where_clause}"
+            "SELECT COUNT({text})::bigint AS count, MIN({numeric})::double precision AS min, MAX({numeric})::double precision AS max, AVG({numeric})::double precision AS avg, SUM({numeric})::double precision AS sum FROM {table_name} {where_clause}"
         );
         return Ok(Some(Aggregation {
             name: name.clone(),
@@ -372,8 +412,9 @@ fn build_aggregation(
 
     if let Some(cardinality) = agg_body.get("cardinality").and_then(Value::as_object) {
         let field = required_field(cardinality, "cardinality aggregation")?;
+        let text = field_text_expression(&field, types);
         let sql = format!(
-            "SELECT COUNT(DISTINCT document ->> '{field}')::bigint AS value FROM {table_name} {where_clause}"
+            "SELECT COUNT(DISTINCT {text})::bigint AS value FROM {table_name} {where_clause}"
         );
         return Ok(Some(Aggregation {
             name: name.clone(),
@@ -464,6 +505,54 @@ fn non_empty_lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// SQL for a field's value in its native type.
+///
+/// A mapped field is a real column; anything else is read out of the residual
+/// `document` JSONB, where every value is text.
+fn field_expression(field: &str, types: &FieldTypes) -> String {
+    match types.get(field) {
+        Some(_) => quote_identifier(field),
+        None => format!("document ->> '{field}'"),
+    }
+}
+
+/// SQL for a field's value rendered as text.
+fn field_text_expression(field: &str, types: &FieldTypes) -> String {
+    match types.get(field) {
+        Some(field_type) => read_expression(field, field_type),
+        None => format!("document ->> '{field}'"),
+    }
+}
+
+/// SQL for a field's value as `double precision`.
+fn field_numeric_expression(field: &str, types: &FieldTypes) -> String {
+    match types.get(field).map(String::as_str) {
+        Some("double" | "float" | "half_float") => quote_identifier(field),
+        Some(_) => format!("{}::double precision", quote_identifier(field)),
+        None => format!("(document ->> '{field}')::double precision"),
+    }
+}
+
+/// SQL for a field's value as `timestamptz`.
+fn field_timestamp_expression(field: &str, types: &FieldTypes) -> String {
+    match types.get(field).map(String::as_str) {
+        Some("date") => quote_identifier(field),
+        Some(_) => format!("({}::text)::timestamptz", quote_identifier(field)),
+        None => format!("(document ->> '{field}')::timestamptz"),
+    }
+}
+
+/// SQL for a bound parameter compared against a field.
+///
+/// Parameters are always bound as text, so a mapped column needs the value
+/// converted to the column type before comparison.
+fn field_param(field: &str, types: &FieldTypes, position: usize) -> String {
+    match types.get(field) {
+        Some(field_type) => param_expression(field_type, position),
+        None => format!("${position}"),
+    }
+}
+
 pub fn assert_identifier(value: &str, label: &str) -> Result<(), String> {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
@@ -549,6 +638,7 @@ fn to_i64(value: Option<&Value>, fallback: i64) -> i64 {
 mod tests {
     use super::{
         assert_identifier, build_search_plan, match_pattern, parse_bulk, parse_multi_search,
+        FieldTypes,
     };
     use serde_json::Value;
 
@@ -579,12 +669,76 @@ mod tests {
         )
         .unwrap();
         let object = body.as_object().unwrap();
-        let plan = build_search_plan(object, "\"books\"").unwrap();
+        let plan = build_search_plan(object, "\"books\"", &FieldTypes::new()).unwrap();
         assert!(plan.where_clause.contains("status"));
         assert!(plan.where_clause.contains("NOT"));
         assert_eq!(plan.values, vec!["published", "true"]);
         assert_eq!(plan.size, 25);
         assert_eq!(plan.from, 2);
+    }
+
+    fn typed(field: &str, field_type: &str) -> FieldTypes {
+        let mut types = FieldTypes::new();
+        let _ = types.insert(field.to_owned(), field_type.to_owned());
+        types
+    }
+
+    fn plan_for(raw: &str, types: &FieldTypes) -> super::SearchPlan {
+        let body: Value = serde_json::from_str(raw).unwrap();
+        let object = body.as_object().unwrap();
+        build_search_plan(object, "\"books\"", types).unwrap()
+    }
+
+    #[test]
+    fn mapped_fields_query_their_column_and_unmapped_fields_use_jsonb() {
+        let query = r#"{"query":{"range":{"views":{"gte":9}}}}"#;
+
+        let mapped = plan_for(query, &typed("views", "long"));
+        assert!(
+            mapped
+                .where_clause
+                .contains(r#""views" >= ($1::text)::BIGINT"#),
+            "{}",
+            mapped.where_clause
+        );
+
+        let unmapped = plan_for(query, &FieldTypes::new());
+        assert!(
+            unmapped.where_clause.contains("document ->> 'views' >= $1"),
+            "{}",
+            unmapped.where_clause
+        );
+    }
+
+    #[test]
+    fn sorting_a_mapped_field_orders_by_the_column() {
+        let plan = plan_for(r#"{"sort":[{"views":"desc"}]}"#, &typed("views", "long"));
+        assert_eq!(plan.sort_clause, r#"ORDER BY "views" DESC"#);
+    }
+
+    #[test]
+    fn numeric_aggregations_skip_the_jsonb_cast_for_mapped_fields() {
+        let plan = plan_for(
+            r#"{"aggs":{"average":{"avg":{"field":"views"}}}}"#,
+            &typed("views", "long"),
+        );
+        let sql = plan.aggregation.map(|aggregation| aggregation.sql);
+        let sql = sql.unwrap_or_default();
+        assert!(sql.contains(r#"AVG("views"::double precision)"#), "{sql}");
+        assert!(!sql.contains("document ->>"), "{sql}");
+    }
+
+    #[test]
+    fn matching_a_mapped_field_compares_it_as_text() {
+        let plan = plan_for(
+            r#"{"query":{"match":{"views":7}}}"#,
+            &typed("views", "long"),
+        );
+        assert!(
+            plan.where_clause.contains(r#""views"::text ILIKE $1"#),
+            "{}",
+            plan.where_clause
+        );
     }
 
     #[test]

@@ -22,10 +22,16 @@ Keep new code in the narrowest appropriate module rather than growing `main.rs`.
 
 ## Compatibility invariants
 
-- Each local index maps to a PostgreSQL table with `id TEXT PRIMARY KEY`, `document JSONB NOT NULL`, and `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`.
+- Each local index maps to a PostgreSQL table with `id TEXT PRIMARY KEY`, `document JSONB NOT NULL`, and `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, plus one typed column per mapped field.
+- Mapped fields are stored in real typed columns; unmapped and dynamic fields stay in the residual `document` JSONB. `_source` is reassembled from both.
+- Every mapped column is indexed at the same point the column is created, so `create_index` and `PUT /_mapping` stay consistent: trigram GIN for `text`, plain GIN for `JSONB`, btree otherwise. A btree over `jsonb` or long prose rejects oversized values at write time, and only trigram GIN serves the `ILIKE` that `match` compiles to.
+- `text` mappings need the `pg_trgm` extension; it is created on demand and its absence is reported rather than silently downgraded.
+- Types that share a column type (`keyword` and `text`) may be remapped to each other, so an index whose access method no longer matches the mapping is dropped and rebuilt.
+- The PostgreSQL catalog is the source of truth for which fields are columns. Index metadata is in-memory and is lost on restart, so reads, writes, and query planning must derive the field set from `information_schema`, never from the in-memory mapping alone.
+- `_source` reassembly columns must stay aliased with the `_espg_col_` prefix. An unaliased `"field"::text` is labelled after its source column, and `ORDER BY field` then binds to that text rendering instead of the typed column.
 - Index names and JSON fields interpolated into SQL must satisfy `[A-Za-z_][A-Za-z0-9_]*`.
 - Query values must remain parameterized; never interpolate user values into SQL.
-- Mapping and settings compatibility metadata is intentionally in-memory and is lost on process restart; documents remain in PostgreSQL.
+- Settings metadata is intentionally in-memory and is lost on process restart; documents and mapped columns remain in PostgreSQL, and the mapping is rebuilt from the columns.
 - `PASSTHROUGH_URL` enables upstream Elasticsearch passthrough. Index-specific passthrough is limited by `PASSTHROUGH_INDICES` wildcard patterns.
 - Preserve the existing query and aggregation subset unless extending it intentionally with focused tests and README updates.
 
