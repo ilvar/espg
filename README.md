@@ -17,7 +17,31 @@ Request handling is split into a few explicit modules:
 
 Each local Elasticsearch index maps to one PostgreSQL table. Documents are stored as `JSONB`; supported Elasticsearch queries are translated into parameterized PostgreSQL SQL. Index and field identifiers that are inserted into SQL are validated before use.
 
-Mappings and settings are compatibility metadata held in memory. They do **not** survive a process restart; stored documents do.
+Mappings and settings are compatibility metadata held in memory. They do **not** survive a process restart; stored documents do. Documents are not validated or coerced against the mapping.
+
+### Mappings
+
+`PUT /:index` accepts `mappings` and `settings` in the request body, and `PUT /:index/_mapping` adds fields to an existing index:
+
+```bash
+curl -XPUT localhost:3000/books -H 'Content-Type: application/json' -d '{
+  "mappings": {"properties": {"title": {"type": "text"}, "views": {"type": "long"}}},
+  "settings": {"index": {"number_of_shards": 1}}
+}'
+
+curl -XPUT localhost:3000/books/_mapping -H 'Content-Type: application/json' -d '{
+  "properties": {"published_at": {"type": "date"}}
+}'
+```
+
+Mapping rules:
+
+- Field names must satisfy `[A-Za-z_][A-Za-z0-9_]*`, the same contract as index names.
+- Each field definition must be an object with a `type` of `binary`, `boolean`, `byte`, `date`, `double`, `float`, `geo_point`, `half_float`, `integer`, `ip`, `keyword`, `long`, `object`, `short`, or `text`. Other keys on the definition (such as `format`) are stored and returned unchanged.
+- Subfields are **not** supported: a field definition containing `properties` or `fields` is rejected with `400`.
+- `PUT /:index/_mapping` merges into the existing mapping. Adding a field or repeating an identical definition succeeds; changing the type of an existing field is rejected with `400`.
+- The body may either wrap fields in `properties` or list them directly. In the direct form, mapping-level keys (`_meta`, `_source`, `date_detection`, `dynamic`, `dynamic_templates`, `numeric_detection`, `runtime`) are accepted and ignored; a field sharing one of those names must be sent inside `properties`.
+- `settings` is accepted both as `{"settings": {"index": {...}}}` and as a bare `{"settings": {...}}`.
 
 ## Configuration
 

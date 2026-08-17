@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::mapping::{merge_mapping_properties, parse_mapping_properties};
 use crate::query::{
     assert_identifier, build_search_plan, build_where_clause, match_pattern, parse_bulk,
     parse_multi_search, quote_identifier, Aggregation, AggregationKind,
@@ -203,10 +204,28 @@ async fn get_index(State(state): State<AppState>, Path(index): Path<String>) -> 
     json_response(StatusCode::OK, Value::Object(payload))
 }
 
-async fn create_index(State(state): State<AppState>, Path(index): Path<String>) -> Response {
+async fn create_index(
+    State(state): State<AppState>,
+    Path(index): Path<String>,
+    body: Bytes,
+) -> Response {
     if let Err(response) = validate_index(&index) {
         return response;
     }
+    let body = match parse_optional_object(&body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    // Validate before creating the table so a rejected mapping leaves no index behind.
+    let mappings = match body.get("mappings") {
+        Some(mappings) => match parse_mapping_properties(mappings) {
+            Ok(mappings) => mappings,
+            Err(error) => return api_error(StatusCode::BAD_REQUEST, &error),
+        },
+        None => Map::new(),
+    };
+    let settings = index_settings(body.get("settings"));
+
     let table = quote_identifier(&index);
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, document JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
@@ -219,10 +238,27 @@ async fn create_index(State(state): State<AppState>, Path(index): Path<String>) 
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     state.index_store.ensure(&index).await;
+    if !mappings.is_empty() {
+        state.index_store.set_mapping(&index, mappings).await;
+    }
+    if !settings.is_empty() {
+        state.index_store.set_settings(&index, settings).await;
+    }
     json_response(
         StatusCode::OK,
         json!({"acknowledged": true, "index": index}),
     )
+}
+
+/// Accept both `{"settings": {"index": {...}}}` and a bare `{"settings": {...}}`.
+fn index_settings(settings: Option<&Value>) -> Map<String, Value> {
+    let Some(settings) = settings.and_then(Value::as_object) else {
+        return Map::new();
+    };
+    match settings.get("index").and_then(Value::as_object) {
+        Some(nested) => nested.clone(),
+        None => settings.clone(),
+    }
 }
 
 async fn delete_index(State(state): State<AppState>, Path(index): Path<String>) -> Response {
@@ -665,13 +701,14 @@ async fn put_mapping(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let mapping = body
-        .get("properties")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    state.index_store.set_mapping(&index, mapping).await;
-    json_response(StatusCode::OK, json!({"acknowledged": true}))
+    let incoming = match parse_mapping_properties(&Value::Object(body)) {
+        Ok(incoming) => incoming,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, &error),
+    };
+    match state.index_store.merge_mapping(&index, &incoming).await {
+        Ok(()) => json_response(StatusCode::OK, json!({"acknowledged": true})),
+        Err(error) => api_error(StatusCode::BAD_REQUEST, &error),
+    }
 }
 
 async fn get_settings(State(state): State<AppState>, Path(index): Path<String>) -> Response {
@@ -1157,6 +1194,21 @@ impl IndexStore {
             .entry(index.to_owned())
             .or_insert_with(IndexMetadata::default);
         metadata.mappings = mapping;
+    }
+
+    /// Merge new properties into the stored mapping, holding the write lock for
+    /// the whole read-modify-write so concurrent updates cannot lose fields.
+    async fn merge_mapping(
+        &self,
+        index: &str,
+        incoming: &Map<String, Value>,
+    ) -> Result<(), String> {
+        let mut items = self.items.write().await;
+        let metadata = items
+            .entry(index.to_owned())
+            .or_insert_with(IndexMetadata::default);
+        metadata.mappings = merge_mapping_properties(&metadata.mappings, incoming)?;
+        Ok(())
     }
 
     async fn set_settings(&self, index: &str, settings: Map<String, Value>) {
