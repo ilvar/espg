@@ -50,6 +50,15 @@ jobs:
           query = Path('src/query.rs')
           source = query.read_text().replace('if lines.len() % 2 != 0 {', 'if !lines.len().is_multiple_of(2) {')
           query.write_text(source)
+
+          main = Path('src/main.rs')
+          source = main.read_text()
+          source = source.replace('use std::process::ExitCode;\n', '')
+          source = source.replace('async fn main() -> ExitCode {', 'async fn main() -> capability::ExitCode {')
+          source = source.replace('Ok(()) => ExitCode::SUCCESS,', 'Ok(()) => capability::ExitCode::SUCCESS,')
+          source = source.replace('            ExitCode::FAILURE', '            capability::ExitCode::FAILURE')
+          source = source.replace('mod capability {\n    use axum::Router;', 'mod capability {\n    pub use std::process::ExitCode;\n\n    use axum::Router;')
+          main.write_text(source)
           PY
           rm -f .github/workflows/bootstrap-rust-rewrite.yml .github/workflows/bootstrap-rust-fix.yml
       - name: Format
