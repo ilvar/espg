@@ -13,7 +13,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
       - name: Format
@@ -27,9 +27,20 @@ jobs:
       - name: Strict Rust check
         run: strictrs check .
 
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Build release binary
+        run: cargo +1.97.1 build --release
+      - name: Print binary size
+        run: ls -lh target/release/espg && du -h target/release/espg
+
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Integration smoke test
         run: ./scripts/run-integration-tests.sh
