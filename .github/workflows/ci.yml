@@ -36,7 +36,11 @@ jobs:
       - name: Build release binary
         run: cargo +1.97.1 build --release
       - name: Print binary size
-        run: ls -lh target/release/espg && du -h target/release/espg
+        run: |
+          SIZE=$(du -h target/release/espg | cut -f1)
+          echo "Binary size: ${SIZE}"
+          echo "### Binary size" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`espg\` release binary: **${SIZE}**" >> "$GITHUB_STEP_SUMMARY"
 
   integration:
     runs-on: ubuntu-latest
