@@ -1,29 +1,124 @@
 use crate::query::assert_identifier;
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
-/// Field types accepted in a mapping definition.
+/// Mapped field name to Elasticsearch type, for one index.
 ///
-/// Mappings are compatibility metadata: documents are stored as `JSONB` and are
-/// not coerced to these types. The list exists so that clients get an
-/// Elasticsearch-shaped rejection for typos instead of silently storing a
-/// mapping that never matches anything.
-const SUPPORTED_TYPES: [&str; 15] = [
-    "binary",
-    "boolean",
-    "byte",
-    "date",
-    "double",
-    "float",
-    "geo_point",
-    "half_float",
-    "integer",
-    "ip",
-    "keyword",
-    "long",
-    "object",
-    "short",
-    "text",
+/// This is derived from the PostgreSQL catalog rather than from the in-memory
+/// metadata, so it stays correct across restarts.
+pub type FieldTypes = BTreeMap<String, String>;
+
+/// Elasticsearch field type to the PostgreSQL column type it is stored in.
+///
+/// A mapped field becomes a real typed column; anything not in the mapping
+/// falls back to the residual `document JSONB` column.
+const TYPE_MAP: [(&str, &str); 15] = [
+    ("binary", "TEXT"),
+    ("boolean", "BOOLEAN"),
+    ("byte", "SMALLINT"),
+    // Spelled as the catalog reports it, so column types round-trip literally.
+    ("date", "TIMESTAMP WITH TIME ZONE"),
+    ("double", "DOUBLE PRECISION"),
+    ("float", "REAL"),
+    ("geo_point", "JSONB"),
+    ("half_float", "REAL"),
+    ("integer", "INTEGER"),
+    ("ip", "TEXT"),
+    ("keyword", "TEXT"),
+    ("long", "BIGINT"),
+    ("object", "JSONB"),
+    ("short", "SMALLINT"),
+    ("text", "TEXT"),
 ];
+
+/// PostgreSQL `information_schema.data_type` to the Elasticsearch type reported
+/// for it. Several Elasticsearch types share a column type, so this is the
+/// representative choice rather than an exact inverse of `TYPE_MAP`.
+const REVERSE_TYPE_MAP: [(&str, &str); 9] = [
+    ("bigint", "long"),
+    ("boolean", "boolean"),
+    ("double precision", "double"),
+    ("integer", "integer"),
+    ("jsonb", "object"),
+    ("real", "float"),
+    ("smallint", "short"),
+    ("text", "keyword"),
+    ("timestamp with time zone", "date"),
+];
+
+/// PostgreSQL truncates identifiers beyond this many bytes.
+const MAX_IDENTIFIER_LENGTH: usize = 63;
+
+/// Alias prefix for the `_source` reassembly columns. Reserved as a field-name
+/// prefix so a mapped column can never shadow one of those output labels.
+pub const SOURCE_COLUMN_PREFIX: &str = "_espg_col_";
+
+/// Format used to render `date` columns back into `_source`, matching the
+/// Elasticsearch `strict_date_optional_time` default.
+const DATE_OUTPUT_FORMAT: &str = r#"YYYY-MM-DD"T"HH24:MI:SS.MS"Z""#;
+
+/// The PostgreSQL column type backing an Elasticsearch field type.
+pub fn postgres_type(field_type: &str) -> Option<&'static str> {
+    TYPE_MAP
+        .iter()
+        .find(|(name, _)| *name == field_type)
+        .map(|(_, sql)| *sql)
+}
+
+/// The Elasticsearch type reported for a PostgreSQL column type.
+pub fn elasticsearch_type(data_type: &str) -> Option<&'static str> {
+    REVERSE_TYPE_MAP
+        .iter()
+        .find(|(name, _)| *name == data_type)
+        .map(|(_, es)| *es)
+}
+
+/// SQL for binding a text parameter into a typed column.
+///
+/// Every parameter in this codebase is bound as text, so the conversion happens
+/// in SQL: `($3::text)::bigint`. The inner cast keeps the parameter type
+/// unambiguous for the PostgreSQL planner.
+pub fn param_expression(field_type: &str, position: usize) -> String {
+    match postgres_type(field_type) {
+        Some("TEXT") | None => format!("${position}::text"),
+        Some(sql_type) => format!("(${position}::text)::{sql_type}"),
+    }
+}
+
+/// SQL for reading a mapped column back as text, for `_source` reassembly.
+pub fn read_expression(field: &str, field_type: &str) -> String {
+    let column = crate::query::quote_identifier(field);
+    match field_type {
+        "date" => format!("to_char({column} AT TIME ZONE 'UTC', '{DATE_OUTPUT_FORMAT}')"),
+        _ => format!("{column}::text"),
+    }
+}
+
+/// Convert a column value, read back as text, into the JSON it came from.
+pub fn json_from_text(field_type: &str, text: &str) -> Value {
+    match field_type {
+        "byte" | "integer" | "long" | "short" => text
+            .parse::<i64>()
+            .ok()
+            .map(Value::from)
+            .unwrap_or_else(|| Value::String(text.to_owned())),
+        "double" | "float" | "half_float" => text
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number)
+            .unwrap_or_else(|| Value::String(text.to_owned())),
+        "boolean" => match text {
+            "true" | "t" => Value::Bool(true),
+            "false" | "f" => Value::Bool(false),
+            _ => Value::String(text.to_owned()),
+        },
+        "geo_point" | "object" => {
+            serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()))
+        }
+        _ => Value::String(text.to_owned()),
+    }
+}
 
 /// Mapping-level keys that sit beside `properties` rather than describing a
 /// field. They are accepted and ignored so that bodies such as
@@ -81,6 +176,8 @@ pub fn parse_mapping_properties(mappings: &Value) -> Result<Map<String, Value>, 
 ///
 /// Elasticsearch allows new fields to be added to a live mapping but rejects a
 /// type change on an existing field. Redefining a field identically is a no-op.
+/// Types are compared by backing column, so a change that keeps the same column
+/// type (`keyword` to `text`) is allowed while one that would not is rejected.
 pub fn merge_mapping_properties(
     existing: &Map<String, Value>,
     incoming: &Map<String, Value>,
@@ -90,7 +187,7 @@ pub fn merge_mapping_properties(
         if let Some(current) = merged.get(field) {
             let current_type = field_type(current);
             let incoming_type = field_type(definition);
-            if current_type != incoming_type {
+            if postgres_type(current_type) != postgres_type(incoming_type) {
                 return Err(format!(
                     "mapper [{field}] cannot be changed from type [{current_type}] to [{incoming_type}]"
                 ));
@@ -105,6 +202,11 @@ pub fn merge_mapping_properties(
 fn validate_field(field: &str, definition: &Value) -> Result<Map<String, Value>, String> {
     assert_identifier(field, "mapping field")
         .map_err(|_| format!("invalid mapping field name [{field}]"))?;
+    if field.starts_with(SOURCE_COLUMN_PREFIX) {
+        return Err(format!(
+            "mapping field name [{field}] uses the reserved prefix [{SOURCE_COLUMN_PREFIX}]"
+        ));
+    }
     let Some(object) = definition.as_object() else {
         return Err(format!("mapping for field [{field}] must be an object"));
     };
@@ -119,12 +221,66 @@ fn validate_field(field: &str, definition: &Value) -> Result<Map<String, Value>,
     let Some(field_type) = field_type.as_str() else {
         return Err(format!("mapping type for field [{field}] must be a string"));
     };
-    if !SUPPORTED_TYPES.contains(&field_type) {
+    if postgres_type(field_type).is_none() {
         return Err(format!(
             "unsupported mapping type [{field_type}] for field [{field}]"
         ));
     }
     Ok(object.clone())
+}
+
+/// Index method for a mapped column.
+///
+/// `JSONB` columns get GIN: a btree over `jsonb` would refuse rows whose value
+/// exceeds the btree tuple limit, turning a large document into a write error.
+/// Everything else gets btree, which serves equality, ranges, and ordering.
+pub fn index_method(field_type: &str) -> &'static str {
+    match postgres_type(field_type) {
+        Some("JSONB") => "GIN",
+        _ => "BTREE",
+    }
+}
+
+/// Index name for a mapped column, clamped to PostgreSQL's identifier limit.
+fn index_name(index: &str, field: &str) -> String {
+    let name = format!("{index}_{field}_idx");
+    match name.char_indices().nth(MAX_IDENTIFIER_LENGTH) {
+        Some((cutoff, _)) => name.get(..cutoff).unwrap_or(&name).to_owned(),
+        None => name,
+    }
+}
+
+/// `CREATE INDEX` statements for a validated set of properties.
+pub fn index_statements(index: &str, properties: &Map<String, Value>) -> Vec<String> {
+    let table = crate::query::quote_identifier(index);
+    let mut statements = Vec::new();
+    for (field, definition) in properties {
+        let field_type = field_type(definition);
+        if postgres_type(field_type).is_none() {
+            continue;
+        }
+        let method = index_method(field_type);
+        statements.push(format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {table} USING {method} ({})",
+            crate::query::quote_identifier(&index_name(index, field)),
+            crate::query::quote_identifier(field)
+        ));
+    }
+    statements
+}
+
+/// Column definitions (`"name" TYPE`) for a validated set of properties.
+pub fn column_definitions(properties: &Map<String, Value>) -> Vec<String> {
+    let mut columns = Vec::new();
+    for (field, definition) in properties {
+        if let Some(sql_type) = postgres_type(field_type(definition)) {
+            columns.push(format!(
+                "{} {sql_type}",
+                crate::query::quote_identifier(field)
+            ));
+        }
+    }
+    columns
 }
 
 fn field_type(definition: &Value) -> &str {
@@ -215,8 +371,88 @@ mod tests {
         let same = properties(json!({"title": {"type": "text"}}));
         assert!(merge_mapping_properties(&existing, &same).is_ok());
 
-        let conflicting = properties(json!({"title": {"type": "keyword"}}));
+        let conflicting = properties(json!({"title": {"type": "long"}}));
         let error = merge_mapping_properties(&existing, &conflicting).unwrap_err();
-        assert!(error.contains("cannot be changed from type [text] to [keyword]"));
+        assert!(error.contains("cannot be changed from type [text] to [long]"));
+    }
+
+    #[test]
+    fn merge_allows_changes_that_keep_the_same_column_type() {
+        let existing = properties(json!({"title": {"type": "text"}}));
+        let widened = properties(json!({"title": {"type": "keyword"}}));
+        assert!(merge_mapping_properties(&existing, &widened).is_ok());
+    }
+
+    #[test]
+    fn every_supported_type_has_a_column_type() {
+        for (field_type, _) in super::TYPE_MAP {
+            assert!(super::postgres_type(field_type).is_some());
+        }
+    }
+
+    #[test]
+    fn column_types_round_trip_to_elasticsearch_types() {
+        for (data_type, field_type) in super::REVERSE_TYPE_MAP {
+            let column = super::postgres_type(field_type)
+                .expect("reverse-mapped type must be supported")
+                .to_lowercase();
+            assert_eq!(
+                column, data_type,
+                "{field_type} should map back to {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_mapped_column_gets_an_index() {
+        let parsed = properties(json!({
+            "title": {"type": "text"},
+            "views": {"type": "long"},
+            "meta": {"type": "object"}
+        }));
+        let statements = super::index_statements("books", &parsed);
+        assert_eq!(statements.len(), parsed.len());
+        assert!(statements.contains(&String::from(
+            r#"CREATE INDEX IF NOT EXISTS "books_views_idx" ON "books" USING BTREE ("views")"#
+        )));
+        // jsonb takes GIN; a btree would reject oversized values on write.
+        assert!(statements.contains(&String::from(
+            r#"CREATE INDEX IF NOT EXISTS "books_meta_idx" ON "books" USING GIN ("meta")"#
+        )));
+    }
+
+    #[test]
+    fn index_names_stay_within_the_identifier_limit() {
+        let field = "f".repeat(80);
+        let parsed = properties(json!({ field.clone(): {"type": "long"} }));
+        let statements = super::index_statements("books", &parsed);
+        let statement = statements.first().cloned().unwrap_or_default();
+        let name = statement.split('"').nth(1).unwrap_or_default().to_owned();
+        assert_eq!(name.len(), super::MAX_IDENTIFIER_LENGTH);
+    }
+
+    #[test]
+    fn columns_are_declared_for_mapped_fields() {
+        let parsed = properties(json!({"title": {"type": "text"}, "views": {"type": "long"}}));
+        let columns = super::column_definitions(&parsed);
+        assert_eq!(columns, vec!["\"title\" TEXT", "\"views\" BIGINT"]);
+    }
+
+    #[test]
+    fn parameters_convert_text_bindings_into_the_column_type() {
+        assert_eq!(super::param_expression("long", 3), "($3::text)::BIGINT");
+        assert_eq!(super::param_expression("keyword", 1), "$1::text");
+    }
+
+    #[test]
+    fn column_text_round_trips_back_into_json() {
+        assert_eq!(super::json_from_text("long", "42"), json!(42));
+        assert_eq!(super::json_from_text("double", "1.5"), json!(1.5));
+        assert_eq!(super::json_from_text("boolean", "t"), json!(true));
+        assert_eq!(super::json_from_text("keyword", "hello"), json!("hello"));
+        assert_eq!(
+            super::json_from_text("object", r#"{"a":1}"#),
+            json!({"a": 1})
+        );
     }
 }

@@ -1,5 +1,9 @@
 use crate::config::Config;
-use crate::mapping::{merge_mapping_properties, parse_mapping_properties};
+use crate::mapping::{
+    column_definitions, elasticsearch_type, index_statements, json_from_text,
+    merge_mapping_properties, param_expression, parse_mapping_properties, postgres_type,
+    read_expression, FieldTypes, SOURCE_COLUMN_PREFIX,
+};
 use crate::query::{
     assert_identifier, build_search_plan, build_where_clause, match_pattern, parse_bulk,
     parse_multi_search, quote_identifier, Aggregation, AggregationKind,
@@ -20,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio_postgres::types::ToSql;
-use tokio_postgres::NoTls;
+use tokio_postgres::{Error as PgError, NoTls, Row};
 
 const MAX_PROXY_BODY: usize = 64 * 1024 * 1024;
 
@@ -183,7 +187,11 @@ async fn get_index(State(state): State<AppState>, Path(index): Path<String>) -> 
         Err(response) => return response,
     }
 
-    let (mapping, settings) = state.index_store.get(&index).await;
+    let mapping = match mapping_properties(&state, &index).await {
+        Ok(mapping) => mapping,
+        Err(response) => return response,
+    };
+    let (_, settings) = state.index_store.get(&index).await;
     let mut index_object = Map::new();
     index_object.insert("aliases".to_owned(), Value::Object(Map::new()));
     index_object.insert(
@@ -227,8 +235,15 @@ async fn create_index(
     let settings = index_settings(body.get("settings"));
 
     let table = quote_identifier(&index);
+    let mut definitions = vec![
+        "id TEXT PRIMARY KEY".to_owned(),
+        "document JSONB NOT NULL".to_owned(),
+        "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()".to_owned(),
+    ];
+    definitions.extend(column_definitions(&mappings));
     let sql = format!(
-        "CREATE TABLE IF NOT EXISTS {table} (id TEXT PRIMARY KEY, document JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+        "CREATE TABLE IF NOT EXISTS {table} ({})",
+        definitions.join(", ")
     );
     let client = match db_client(&state).await {
         Ok(client) => client,
@@ -236,6 +251,11 @@ async fn create_index(
     };
     if let Err(error) = client.execute(&sql, &[]).await {
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    // The table may have pre-existed, in which case CREATE TABLE IF NOT EXISTS
+    // added nothing; bring any missing mapped columns and their indexes into being.
+    if let Err(response) = ensure_columns(&client, &index, &mappings).await {
+        return response;
     }
     state.index_store.ensure(&index).await;
     if !mappings.is_empty() {
@@ -248,6 +268,48 @@ async fn create_index(
         StatusCode::OK,
         json!({"acknowledged": true, "index": index}),
     )
+}
+
+/// Add a column, and its index, for every mapped field the table lacks.
+///
+/// `IF NOT EXISTS` on both statements makes this idempotent, so re-declaring an
+/// unchanged mapping is a no-op. Type changes are rejected before this runs,
+/// which is what keeps an existing column's type and its mapping in agreement.
+async fn ensure_columns(
+    client: &Object,
+    index: &str,
+    properties: &Map<String, Value>,
+) -> Result<(), Response> {
+    if properties.is_empty() {
+        return Ok(());
+    }
+    let table = quote_identifier(index);
+    for definition in column_definitions(properties) {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {definition}");
+        client
+            .execute(&sql, &[])
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    }
+    // Indexed after the columns exist, so this covers both a fresh table and a
+    // mapping update that added fields.
+    for sql in index_statements(index, properties) {
+        client
+            .execute(&sql, &[])
+            .await
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Message for a write PostgreSQL refused — most often a value that will not
+/// convert to its mapped column type. `tokio_postgres::Error` renders as a bare
+/// "db error", so surface the database's own message instead.
+fn write_error(error: &PgError) -> String {
+    match error.as_db_error() {
+        Some(db_error) => db_error.message().to_owned(),
+        None => error.to_string(),
+    }
 }
 
 /// Accept both `{"settings": {"index": {...}}}` and a bare `{"settings": {...}}`.
@@ -325,15 +387,16 @@ async fn upsert_document_response(
         Ok(client) => client,
         Err(response) => return response,
     };
-    let table = quote_identifier(index);
-    let sql = format!(
-        "INSERT INTO {table} (id, document) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET document = EXCLUDED.document RETURNING (xmax = 0)"
-    );
-    let value = Value::Object(document);
-    let params: [&(dyn ToSql + Sync); 2] = [&id, &value];
+    let types = match field_types_with_client(&client, index).await {
+        Ok(types) => types,
+        Err(response) => return response,
+    };
+    let (sql, residual, values) = build_upsert(index, &types, document, " RETURNING (xmax = 0)");
+    let id = id.to_owned();
+    let params = upsert_params(&id, &residual, &values);
     let row = match client.query_one(&sql, &params).await {
         Ok(row) => row,
-        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, &write_error(&error)),
     };
     let inserted = match row.try_get::<_, bool>(0) {
         Ok(inserted) => inserted,
@@ -362,8 +425,15 @@ async fn get_document(
         Ok(client) => client,
         Err(response) => return response,
     };
+    let types = match field_types_with_client(&client, &index).await {
+        Ok(types) => types,
+        Err(response) => return response,
+    };
     let table = quote_identifier(&index);
-    let sql = format!("SELECT document FROM {table} WHERE id = $1");
+    let sql = format!(
+        "SELECT {} FROM {table} WHERE id = $1",
+        source_select_list(&types)
+    );
     let row = match client.query_opt(&sql, &[&id]).await {
         Ok(row) => row,
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -374,9 +444,9 @@ async fn get_document(
             json!({"_index": index, "_id": id, "found": false}),
         );
     };
-    let document = match row.try_get::<_, Value>(0) {
+    let document = match read_source(&row, 0, &types) {
         Ok(document) => document,
-        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(response) => return response,
     };
     json_response(
         StatusCode::OK,
@@ -425,17 +495,21 @@ async fn delete_by_query(
         Ok(body) => body,
         Err(response) => return response,
     };
+    let client = match db_client(&state).await {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
+    let types = match field_types_with_client(&client, &index).await {
+        Ok(types) => types,
+        Err(response) => return response,
+    };
     let mut values = Vec::new();
-    let where_clause = match build_where_clause(body.get("query"), &mut values) {
+    let where_clause = match build_where_clause(body.get("query"), &mut values, &types) {
         Ok(clause) => clause,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error),
     };
     let table = quote_identifier(&index);
     let sql = format!("DELETE FROM {table} {where_clause}");
-    let client = match db_client(&state).await {
-        Ok(client) => client,
-        Err(response) => return response,
-    };
     let params = text_params(&values);
     let affected = match client.execute(&sql, &params).await {
         Ok(affected) => affected,
@@ -476,14 +550,25 @@ async fn update_document(
         Ok(client) => client,
         Err(response) => return response,
     };
+    let types = match field_types_with_client(&client, &index).await {
+        Ok(types) => types,
+        Err(response) => return response,
+    };
     let table = quote_identifier(&index);
-    let update_sql =
-        format!("UPDATE {table} SET document = document || $1 WHERE id = $2 RETURNING id");
-    let doc_value = Value::Object(doc.clone());
-    let params: [&(dyn ToSql + Sync); 2] = [&doc_value, &id];
+    let assignments = build_update_assignments(&types, doc);
+    let id_position = assignments.values.len() + 2;
+    let update_sql = format!(
+        "UPDATE {table} SET {} WHERE id = ${id_position} RETURNING id",
+        assignments.set_clause
+    );
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&assignments.residual];
+    for value in &assignments.values {
+        params.push(value);
+    }
+    params.push(&id);
     let row = match client.query_opt(&update_sql, &params).await {
         Ok(row) => row,
-        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, &write_error(&error)),
     };
     if row.is_some() {
         return json_response(
@@ -492,7 +577,7 @@ async fn update_document(
         );
     }
     if doc_as_upsert || has_upsert {
-        return upsert_document_with_client(&mut client, &index, &id, doc_value).await;
+        return upsert_document_with_client(&mut client, &index, &id, doc.clone()).await;
     }
     json_response(
         StatusCode::NOT_FOUND,
@@ -504,16 +589,18 @@ async fn upsert_document_with_client(
     client: &mut Object,
     index: &str,
     id: &str,
-    document: Value,
+    document: Map<String, Value>,
 ) -> Response {
-    let table = quote_identifier(index);
-    let sql = format!(
-        "INSERT INTO {table} (id, document) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET document = EXCLUDED.document RETURNING (xmax = 0)"
-    );
-    let params: [&(dyn ToSql + Sync); 2] = [&id, &document];
+    let types = match field_types_with_client(client, index).await {
+        Ok(types) => types,
+        Err(response) => return response,
+    };
+    let (sql, residual, values) = build_upsert(index, &types, document, " RETURNING (xmax = 0)");
+    let id = id.to_owned();
+    let params = upsert_params(&id, &residual, &values);
     let row = match client.query_one(&sql, &params).await {
         Ok(row) => row,
-        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, &write_error(&error)),
     };
     let inserted = match row.try_get::<_, bool>(0) {
         Ok(inserted) => inserted,
@@ -550,22 +637,37 @@ async fn update_by_query(
     else {
         return api_error(StatusCode::BAD_REQUEST, "update_by_query requires doc");
     };
-    let mut numbered_values = vec![String::new()];
-    let where_clause = match build_where_clause(body.get("query"), &mut numbered_values) {
-        Ok(clause) => clause,
-        Err(error) => return api_error(StatusCode::BAD_REQUEST, &error),
-    };
-    let values = numbered_values.into_iter().skip(1).collect::<Vec<String>>();
-    let table = quote_identifier(&index);
-    let sql = format!("UPDATE {table} SET document = document || $1 {where_clause}");
     let client = match db_client(&state).await {
         Ok(client) => client,
         Err(response) => return response,
     };
-    let doc_value = Value::Object(doc.clone());
+    let types = match field_types_with_client(&client, &index).await {
+        Ok(types) => types,
+        Err(response) => return response,
+    };
+    let assignments = build_update_assignments(&types, doc);
+    // Reserve the SET parameters so the query's own placeholders start after them.
+    let reserved = assignments.values.len() + 1;
+    let mut numbered_values = vec![String::new(); reserved];
+    let where_clause = match build_where_clause(body.get("query"), &mut numbered_values, &types) {
+        Ok(clause) => clause,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, &error),
+    };
+    let values = numbered_values
+        .into_iter()
+        .skip(reserved)
+        .collect::<Vec<String>>();
+    let table = quote_identifier(&index);
+    let sql = format!(
+        "UPDATE {table} SET {} {where_clause}",
+        assignments.set_clause
+    );
     let text_params = text_params(&values);
-    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(text_params.len() + 1);
-    params.push(&doc_value);
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(text_params.len() + reserved);
+    params.push(&assignments.residual);
+    for value in &assignments.values {
+        params.push(value);
+    }
     params.extend(text_params);
     let affected = match client.execute(&sql, &params).await {
         Ok(affected) => affected,
@@ -590,14 +692,14 @@ async fn bulk(State(state): State<AppState>, Path(index): Path<String>, body: By
         Ok(client) => client,
         Err(response) => return response,
     };
+    let types = match field_types_with_client(&client, &index).await {
+        Ok(types) => types,
+        Err(response) => return response,
+    };
     let transaction = match client.transaction().await {
         Ok(transaction) => transaction,
         Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    let table = quote_identifier(&index);
-    let sql = format!(
-        "INSERT INTO {table} (id, document) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET document = EXCLUDED.document"
-    );
     let mut items = Vec::with_capacity(operations.len());
     for (position, operation) in operations.into_iter().enumerate() {
         let id = match operation.id {
@@ -615,10 +717,10 @@ async fn bulk(State(state): State<AppState>, Path(index): Path<String>, body: By
                 }
             }
         };
-        let source = Value::Object(operation.source);
-        let params: [&(dyn ToSql + Sync); 2] = [&id, &source];
+        let (sql, residual, values) = build_upsert(&index, &types, operation.source, "");
+        let params = upsert_params(&id, &residual, &values);
         if let Err(error) = transaction.execute(&sql, &params).await {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            return api_error(StatusCode::BAD_REQUEST, &write_error(&error));
         }
         items.push(json!({"index": {"_id": id, "status": 201}}));
     }
@@ -650,17 +752,21 @@ async fn count(State(state): State<AppState>, Path(index): Path<String>, body: B
         Ok(body) => body,
         Err(response) => return response,
     };
+    let client = match db_client(&state).await {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
+    let types = match field_types_with_client(&client, &index).await {
+        Ok(types) => types,
+        Err(response) => return response,
+    };
     let mut values = Vec::new();
-    let where_clause = match build_where_clause(body.get("query"), &mut values) {
+    let where_clause = match build_where_clause(body.get("query"), &mut values, &types) {
         Ok(clause) => clause,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error),
     };
     let table = quote_identifier(&index);
     let sql = format!("SELECT COUNT(*)::bigint FROM {table} {where_clause}");
-    let client = match db_client(&state).await {
-        Ok(client) => client,
-        Err(response) => return response,
-    };
     let params = text_params(&values);
     let row = match client.query_one(&sql, &params).await {
         Ok(row) => row,
@@ -683,7 +789,10 @@ async fn get_mapping(State(state): State<AppState>, Path(index): Path<String>) -
     if let Err(response) = validate_existing_index(&state, &index).await {
         return response;
     }
-    let (mapping, _) = state.index_store.get(&index).await;
+    let mapping = match mapping_properties(&state, &index).await {
+        Ok(mapping) => mapping,
+        Err(response) => return response,
+    };
     let mut payload = Map::new();
     payload.insert(index, json!({"mappings": {"properties": mapping}}));
     json_response(StatusCode::OK, Value::Object(payload))
@@ -705,10 +814,52 @@ async fn put_mapping(
         Ok(incoming) => incoming,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error),
     };
+    let client = match db_client(&state).await {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
+    // Conflicts are checked against the live columns, not the in-memory
+    // mapping, because the columns outlive the process.
+    let existing = match field_types_with_client(&client, &index).await {
+        Ok(existing) => existing,
+        Err(response) => return response,
+    };
+    if let Err(error) = assert_column_types_compatible(&existing, &incoming) {
+        return api_error(StatusCode::BAD_REQUEST, &error);
+    }
+    if let Err(response) = ensure_columns(&client, &index, &incoming).await {
+        return response;
+    }
     match state.index_store.merge_mapping(&index, &incoming).await {
         Ok(()) => json_response(StatusCode::OK, json!({"acknowledged": true})),
         Err(error) => api_error(StatusCode::BAD_REQUEST, &error),
     }
+}
+
+/// Reject a mapping update that would need an existing column to change type.
+///
+/// Column types are compared rather than the declared Elasticsearch types, so
+/// widening `keyword` to `text` (both `TEXT`) is allowed while `text` to `long`
+/// is not.
+fn assert_column_types_compatible(
+    existing: &FieldTypes,
+    incoming: &Map<String, Value>,
+) -> Result<(), String> {
+    for (field, definition) in incoming {
+        let Some(current) = existing.get(field) else {
+            continue;
+        };
+        let incoming_type = definition
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("object");
+        if postgres_type(current) != postgres_type(incoming_type) {
+            return Err(format!(
+                "mapper [{field}] cannot be changed from type [{current}] to [{incoming_type}]"
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn get_settings(State(state): State<AppState>, Path(index): Path<String>) -> Response {
@@ -818,8 +969,15 @@ async fn multi_get(state: &AppState, route_index: Option<String>, body: &[u8]) -
             found.insert(index, BTreeMap::new());
             continue;
         }
+        let types = match field_types_with_client(&client, &index).await {
+            Ok(types) => types,
+            Err(response) => return response,
+        };
         let table = quote_identifier(&index);
-        let sql = format!("SELECT id, document FROM {table} WHERE id = ANY($1)");
+        let sql = format!(
+            "SELECT id, {} FROM {table} WHERE id = ANY($1)",
+            source_select_list(&types)
+        );
         let rows = match client.query(&sql, &[&ids]).await {
             Ok(rows) => rows,
             Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -832,11 +990,9 @@ async fn multi_get(state: &AppState, route_index: Option<String>, body: &[u8]) -
                     return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
                 }
             };
-            let document = match row.try_get::<_, Value>(1) {
+            let document = match read_source(&row, 1, &types) {
                 Ok(document) => document,
-                Err(error) => {
-                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
-                }
+                Err(response) => return response,
             };
             documents.insert(id, document);
         }
@@ -925,18 +1081,28 @@ async fn execute_search(
     body: &Map<String, Value>,
 ) -> Result<Value, SearchError> {
     let table = quote_identifier(index);
-    let plan = build_search_plan(body, &table).map_err(|message| SearchError {
-        status: StatusCode::BAD_REQUEST,
-        message,
-    })?;
-    let sql = format!(
-        "SELECT id, document FROM {table} {} {} LIMIT {} OFFSET {}",
-        plan.where_clause, plan.sort_clause, plan.size, plan.from
-    );
     let client = state.pool.get().await.map_err(|error| SearchError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: error.to_string(),
     })?;
+    let types = field_types_with_client(&client, index)
+        .await
+        .map_err(|_| SearchError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "failed to read index columns".to_owned(),
+        })?;
+    let plan = build_search_plan(body, &table, &types).map_err(|message| SearchError {
+        status: StatusCode::BAD_REQUEST,
+        message,
+    })?;
+    let sql = format!(
+        "SELECT id, {} FROM {table} {} {} LIMIT {} OFFSET {}",
+        source_select_list(&types),
+        plan.where_clause,
+        plan.sort_clause,
+        plan.size,
+        plan.from
+    );
     let params = text_params(&plan.values);
     let rows = client
         .query(&sql, &params)
@@ -951,9 +1117,9 @@ async fn execute_search(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: error.to_string(),
         })?;
-        let document = row.try_get::<_, Value>(1).map_err(|error| SearchError {
+        let document = read_source(&row, 1, &types).map_err(|_| SearchError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: error.to_string(),
+            message: "failed to read document".to_owned(),
         })?;
         hits.push(json!({"_id": id, "_source": document}));
     }
@@ -1081,6 +1247,225 @@ async fn validate_existing_index(state: &AppState, index: &str) -> Result<(), Re
 fn validate_index(index: &str) -> Result<(), Response> {
     assert_identifier(index, "index name")
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))
+}
+
+/// Columns that hold espg bookkeeping rather than document fields.
+const RESERVED_COLUMNS: [&str; 3] = ["id", "document", "created_at"];
+
+/// Mapped fields for an index, read from the PostgreSQL catalog.
+///
+/// The catalog is the source of truth: index metadata is in-memory and is lost
+/// on restart, but the columns are durable. Deriving the field set from the
+/// schema keeps reads and queries pointed at the right storage either way.
+async fn field_types_with_client(client: &Object, index: &str) -> Result<FieldTypes, Response> {
+    let rows = client
+        .query(
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1",
+            &[&index],
+        )
+        .await
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    let mut types = FieldTypes::new();
+    for row in rows {
+        let column = row
+            .try_get::<_, String>(0)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+        if RESERVED_COLUMNS.contains(&column.as_str()) {
+            continue;
+        }
+        let data_type = row
+            .try_get::<_, String>(1)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+        if let Some(field_type) = elasticsearch_type(&data_type) {
+            let _ = types.insert(column, field_type.to_owned());
+        }
+    }
+    Ok(types)
+}
+
+/// Mapping properties for an index, reconciling the columns with stored metadata.
+///
+/// The columns decide which fields exist. A stored definition is preferred when
+/// it still agrees with the column type, so extras such as `format` survive;
+/// otherwise the type is reported from the column alone, which is what happens
+/// after a restart drops the in-memory metadata.
+async fn mapping_properties(state: &AppState, index: &str) -> Result<Map<String, Value>, Response> {
+    let client = db_client(state).await?;
+    let types = field_types_with_client(&client, index).await?;
+    let (stored, _) = state.index_store.get(index).await;
+    let mut properties = Map::new();
+    for (field, field_type) in &types {
+        let definition = stored
+            .get(field)
+            .filter(|definition| {
+                let stored_type = definition.get("type").and_then(Value::as_str);
+                stored_type.and_then(postgres_type) == postgres_type(field_type)
+            })
+            .cloned()
+            .unwrap_or_else(|| json!({"type": field_type}));
+        let _ = properties.insert(field.clone(), definition);
+    }
+    Ok(properties)
+}
+
+/// Split a document into mapped column values and the residual JSONB.
+///
+/// Mapped fields become typed columns; everything else stays in `document`, so
+/// unmapped and dynamic fields keep working exactly as before. One value is
+/// produced for every mapped field in `types` order — absent fields bind NULL,
+/// which is what makes an upsert replace rather than merge.
+fn split_document(
+    mut document: Map<String, Value>,
+    types: &FieldTypes,
+) -> (Vec<Option<String>>, Value) {
+    let mut columns = Vec::new();
+    for field in types.keys() {
+        columns.push(bind_value(document.remove(field)));
+    }
+    (columns, Value::Object(document))
+}
+
+/// Render a JSON value as the text a typed column parameter is bound from.
+fn bind_value(value: Option<Value>) -> Option<String> {
+    match value {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text),
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+/// Build the upsert statement and its bound values for a full document.
+///
+/// Returns the SQL, the residual JSONB for `$2`, and the mapped column values
+/// starting at `$3`.
+fn build_upsert(
+    index: &str,
+    types: &FieldTypes,
+    document: Map<String, Value>,
+    returning: &str,
+) -> (String, Value, Vec<Option<String>>) {
+    let table = quote_identifier(index);
+    let (values, residual) = split_document(document, types);
+    let mut names = vec!["id".to_owned(), "document".to_owned()];
+    let mut placeholders = vec!["$1".to_owned(), "$2".to_owned()];
+    let mut position = 2;
+    for (field, field_type) in types {
+        position += 1;
+        names.push(quote_identifier(field));
+        placeholders.push(param_expression(field_type, position));
+    }
+    let updates = names
+        .iter()
+        .skip(1)
+        .map(|name| format!("{name} = EXCLUDED.{name}"))
+        .collect::<Vec<String>>()
+        .join(", ");
+    let sql = format!(
+        "INSERT INTO {table} ({}) VALUES ({}) ON CONFLICT (id) DO UPDATE SET {updates}{returning}",
+        names.join(", "),
+        placeholders.join(", ")
+    );
+    (sql, residual, values)
+}
+
+/// Assignments for a partial update.
+///
+/// Unlike an upsert, only the mapped fields actually present in `doc` are
+/// assigned, so an update leaves untouched columns alone. `$1` is reserved for
+/// the residual JSONB patch and mapped values are numbered from `$2`.
+struct UpdateAssignments {
+    set_clause: String,
+    residual: Value,
+    values: Vec<Option<String>>,
+}
+
+fn build_update_assignments(types: &FieldTypes, doc: &Map<String, Value>) -> UpdateAssignments {
+    let mut assignments = vec!["document = document || $1".to_owned()];
+    let mut values = Vec::new();
+    let mut residual = doc.clone();
+    let mut position = 1;
+    for (field, field_type) in types {
+        let Some(value) = residual.remove(field) else {
+            continue;
+        };
+        position += 1;
+        assignments.push(format!(
+            "{} = {}",
+            quote_identifier(field),
+            param_expression(field_type, position)
+        ));
+        values.push(bind_value(Some(value)));
+    }
+    UpdateAssignments {
+        set_clause: assignments.join(", "),
+        residual: Value::Object(residual),
+        values,
+    }
+}
+
+/// Collect bound parameters for an upsert into the shape `query` expects.
+fn upsert_params<'a>(
+    id: &'a String,
+    residual: &'a Value,
+    values: &'a [Option<String>],
+) -> Vec<&'a (dyn ToSql + Sync)> {
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![id, residual];
+    for value in values {
+        params.push(value);
+    }
+    params
+}
+
+/// `SELECT` list that reads the residual JSONB plus every mapped column as text.
+///
+/// Each expression is aliased. Without an alias, `"views"::text` is labelled
+/// `views` in the output, and `ORDER BY views` resolves against output labels
+/// before input columns — which would sort the text rendering rather than the
+/// typed column, silently restoring the lexicographic ordering this change
+/// exists to fix. [`SOURCE_COLUMN_PREFIX`] is reserved in mapping validation so
+/// a field name can never collide with one of these aliases.
+fn source_select_list(types: &FieldTypes) -> String {
+    let mut parts = vec!["document".to_owned()];
+    for (position, (field, field_type)) in types.iter().enumerate() {
+        parts.push(format!(
+            "{} AS {SOURCE_COLUMN_PREFIX}{position}",
+            read_expression(field, field_type)
+        ));
+    }
+    parts.join(", ")
+}
+
+/// Rebuild `_source` from the residual JSONB and the mapped column values.
+///
+/// `offset` is the row index of the residual `document` column; mapped columns
+/// follow it in the order [`source_select_list`] emitted them.
+// Errors are `Response` throughout this module; boxing here alone would buy
+// nothing and break the pattern every handler already follows.
+#[allow(clippy::result_large_err)]
+fn read_source(row: &Row, offset: usize, types: &FieldTypes) -> Result<Value, Response> {
+    let mut document = row
+        .try_get::<_, Value>(offset)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+    let object = document.as_object_mut().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stored document is not an object",
+        )
+    })?;
+    for (position, (field, field_type)) in types.iter().enumerate() {
+        let index = offset
+            .checked_add(position)
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| api_error(StatusCode::INTERNAL_SERVER_ERROR, "column index overflow"))?;
+        let text = row
+            .try_get::<_, Option<String>>(index)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?;
+        if let Some(text) = text {
+            let _ = object.insert(field.clone(), json_from_text(field_type, &text));
+        }
+    }
+    Ok(document)
 }
 
 async fn index_exists(state: &AppState, index: &str) -> Result<bool, Response> {
@@ -1352,4 +1737,64 @@ async fn proxy_parts(
         Err(error) => return api_error(StatusCode::BAD_GATEWAY, &error.to_string()),
     };
     (status, headers, body).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_update_assignments, source_select_list, split_document};
+    use crate::mapping::FieldTypes;
+    use serde_json::{json, Map, Value};
+
+    fn types() -> FieldTypes {
+        let mut types = FieldTypes::new();
+        let _ = types.insert("title".to_owned(), "text".to_owned());
+        let _ = types.insert("views".to_owned(), "long".to_owned());
+        types
+    }
+
+    fn object(value: Value) -> Map<String, Value> {
+        value.as_object().cloned().unwrap_or_default()
+    }
+
+    /// Without aliases the reassembly columns are labelled after their source
+    /// column, and `ORDER BY views` binds to the text rendering instead of the
+    /// typed column — sorting numbers lexicographically again.
+    #[test]
+    fn source_columns_are_aliased_so_they_cannot_shadow_a_sort_field() {
+        let list = source_select_list(&types());
+        assert_eq!(
+            list,
+            "document, \"title\"::text AS _espg_col_0, \"views\"::text AS _espg_col_1"
+        );
+    }
+
+    #[test]
+    fn documents_split_into_columns_and_residual_json() {
+        let (values, residual) = split_document(
+            object(json!({"title": "Dune", "views": 9, "note": "unmapped"})),
+            &types(),
+        );
+        assert_eq!(values, vec![Some("Dune".to_owned()), Some("9".to_owned())]);
+        assert_eq!(residual, json!({"note": "unmapped"}));
+    }
+
+    /// An upsert replaces the whole document, so a mapped field the caller
+    /// omitted has to bind NULL rather than keep its previous value.
+    #[test]
+    fn omitted_mapped_fields_bind_null_on_upsert() {
+        let (values, _) = split_document(object(json!({"title": "Dune"})), &types());
+        assert_eq!(values, vec![Some("Dune".to_owned()), None]);
+    }
+
+    /// A partial update touches only the fields it names.
+    #[test]
+    fn partial_updates_assign_only_the_fields_present() {
+        let assignments = build_update_assignments(&types(), &object(json!({"views": 42})));
+        assert_eq!(
+            assignments.set_clause,
+            "document = document || $1, \"views\" = ($2::text)::BIGINT"
+        );
+        assert_eq!(assignments.values, vec![Some("42".to_owned())]);
+        assert_eq!(assignments.residual, json!({}));
+    }
 }
