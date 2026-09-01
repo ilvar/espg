@@ -91,9 +91,17 @@ fn build_query_clause(
     }
 
     if let Some(term) = query_map.get("term").and_then(Value::as_object) {
-        if let Some((field, value)) = term.iter().next() {
+        if let Some((field, raw)) = term.iter().next() {
             assert_identifier(field, "term field")?;
-            values.push(value_to_string(value));
+            let (value, case_insensitive) = term_value(raw);
+            values.push(value_to_string(&value));
+            if case_insensitive {
+                return Ok(format!(
+                    "lower({}) = lower(${})",
+                    field_text_expression(field, types),
+                    values.len()
+                ));
+            }
             return Ok(format!(
                 "{} = {}",
                 field_expression(field, types),
@@ -117,50 +125,75 @@ fn build_query_clause(
     if let Some(terms) = query_map.get("terms").and_then(Value::as_object) {
         if let Some((field, value)) = terms.iter().next() {
             assert_identifier(field, "terms field")?;
-            let Some(list) = value.as_array() else {
-                return Ok(String::new());
-            };
-            let mut placeholders = Vec::new();
-            for item in list {
-                values.push(value_to_string(item));
-                placeholders.push(field_param(field, types, values.len()));
+            if let Some(list) = value.as_array() {
+                let mut placeholders = Vec::new();
+                for item in list {
+                    values.push(value_to_string(item));
+                    placeholders.push(field_param(field, types, values.len()));
+                }
+                if !placeholders.is_empty() {
+                    return Ok(format!(
+                        "{} IN ({})",
+                        field_expression(field, types),
+                        placeholders.join(", ")
+                    ));
+                }
             }
-            if placeholders.is_empty() {
-                return Ok(String::new());
-            }
-            return Ok(format!(
-                "{} IN ({})",
-                field_expression(field, types),
-                placeholders.join(", ")
-            ));
         }
     }
 
     if let Some(range) = query_map.get("range").and_then(Value::as_object) {
         if let Some((field, value)) = range.iter().next() {
             assert_identifier(field, "range field")?;
-            let Some(constraints) = value.as_object() else {
-                return Ok(String::new());
-            };
-            let mut clauses = Vec::new();
-            if let Some(gte) = constraints.get("gte") {
-                values.push(value_to_string(gte));
-                clauses.push(format!(
-                    "{} >= {}",
-                    field_expression(field, types),
-                    field_param(field, types, values.len())
-                ));
+            if let Some(constraints) = value.as_object() {
+                let mut clauses = Vec::new();
+                for (key, operator) in [("gte", ">="), ("gt", ">"), ("lte", "<="), ("lt", "<")] {
+                    if let Some(bound) = constraints.get(key) {
+                        values.push(value_to_string(bound));
+                        clauses.push(format!(
+                            "{} {} {}",
+                            field_expression(field, types),
+                            operator,
+                            field_param(field, types, values.len())
+                        ));
+                    }
+                }
+                if !clauses.is_empty() {
+                    return Ok(clauses.join(" AND "));
+                }
             }
-            if let Some(lte) = constraints.get("lte") {
-                values.push(value_to_string(lte));
-                clauses.push(format!(
-                    "{} <= {}",
-                    field_expression(field, types),
-                    field_param(field, types, values.len())
-                ));
-            }
-            if !clauses.is_empty() {
-                return Ok(clauses.join(" AND "));
+        }
+    }
+
+    if let Some(wildcard) = query_map.get("wildcard").and_then(Value::as_object) {
+        if let Some((field, raw)) = wildcard.iter().next() {
+            assert_identifier(field, "wildcard field")?;
+            let (value, _case_insensitive) = term_value(raw);
+            values.push(glob_to_like(&value_to_string(&value)));
+            return Ok(format!(
+                "{} ILIKE ${}",
+                field_text_expression(field, types),
+                values.len()
+            ));
+        }
+    }
+
+    if let Some(exists) = query_map.get("exists").and_then(Value::as_object) {
+        if let Some(field) = exists.get("field").and_then(Value::as_str) {
+            return exists_clause(field, types, false);
+        }
+    }
+
+    if let Some(script) = query_map.get("script").and_then(Value::as_object) {
+        let source = script
+            .get("script")
+            .and_then(Value::as_object)
+            .and_then(|inner| inner.get("source"))
+            .or_else(|| script.get("source"))
+            .and_then(Value::as_str);
+        if let Some(source) = source {
+            if let Some((field, positive)) = parse_exists_script(source) {
+                return exists_clause(&field, types, !positive);
             }
         }
     }
@@ -190,11 +223,11 @@ fn build_query_clause(
             }
         }
 
-        if !clauses.is_empty() {
-            return Ok(clauses.join(" AND "));
-        }
+        return Ok(clauses.join(" AND "));
     }
 
+    let operand = Value::Object(query_map.clone());
+    eprintln!("query operand could not be parsed or mapped: {operand}");
     Ok(String::new())
 }
 
@@ -615,6 +648,107 @@ fn value_to_string(value: &Value) -> String {
     }
 }
 
+/// Split an Elasticsearch term/wildcard value into its scalar and its
+/// `case_insensitive` flag.
+///
+/// The Elasticsearch Java client (used by GQL) serializes these queries in
+/// their expanded object form, `{"value": v, "case_insensitive": true}`, so the
+/// scalar shorthand and the object form must both be accepted.
+fn term_value(raw: &Value) -> (Value, bool) {
+    if let Some(object) = raw.as_object() {
+        if let Some(value) = object.get("value") {
+            let case_insensitive = object
+                .get("case_insensitive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            return (value.clone(), case_insensitive);
+        }
+    }
+    (raw.clone(), false)
+}
+
+/// Translate a Lucene wildcard pattern into a `LIKE` pattern.
+///
+/// `*` and `?` become `%` and `_`; literal `%`, `_`, and `\` are escaped so
+/// they match themselves under the default `\` escape character. A `\` in the
+/// source escapes the following character, matching Lucene wildcard semantics.
+fn glob_to_like(glob: &str) -> String {
+    let mut out = String::with_capacity(glob.len());
+    let mut chars = glob.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    if next == '%' || next == '_' || next == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(next);
+                }
+            }
+            '*' => out.push('%'),
+            '?' => out.push('_'),
+            '%' | '_' => {
+                out.push('\\');
+                out.push(character);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// SQL for an Elasticsearch `exists` clause on `field`.
+///
+/// A mapped column tests `IS NOT NULL`. Anything else is a path into the
+/// residual `document` JSONB, where a JSON `null` counts as absent to match
+/// Elasticsearch. Dotted paths (used by GQL array fields) navigate nested
+/// JSONB. `negate` produces the `NOT_EXISTS` form.
+fn exists_clause(field: &str, types: &FieldTypes, negate: bool) -> Result<String, String> {
+    let segments = field.split('.').collect::<Vec<&str>>();
+    for segment in &segments {
+        assert_identifier(segment, "exists field")?;
+    }
+    let base = if segments.len() == 1 && types.get(field).is_some() {
+        format!("{} IS NOT NULL", quote_identifier(field))
+    } else {
+        let mut path = String::from("document");
+        for segment in &segments {
+            path.push_str(&format!(" -> '{segment}'"));
+        }
+        format!("({path} IS NOT NULL AND {path} <> 'null'::jsonb)")
+    };
+    if negate {
+        Ok(format!("NOT ({base})"))
+    } else {
+        Ok(base)
+    }
+}
+
+/// Recognize the field-existence Painless scripts GQL emits for its `EXISTS`
+/// and `NOT_EXISTS` functions.
+///
+/// Returns the field and whether the script asserts existence (`true`) or
+/// non-existence (`false`). Any other script is left untranslated.
+fn parse_exists_script(source: &str) -> Option<(String, bool)> {
+    let field = extract_script_field(source)?;
+    if source.contains("instanceof List") {
+        Some((field, true))
+    } else if source.contains("!doc.containsKey") {
+        Some((field, false))
+    } else {
+        None
+    }
+}
+
+/// Pull the field name out of the first `doc['field']` reference in a script.
+fn extract_script_field(source: &str) -> Option<String> {
+    let marker = "doc['";
+    let start = source.find(marker)?.checked_add(marker.len())?;
+    let rest = source.get(start..)?;
+    let end = rest.find("']")?;
+    Some(rest.get(..end)?.to_owned())
+}
+
 fn number_as_f64(value: &Value) -> Option<f64> {
     match value {
         Value::Number(number) => number.as_f64(),
@@ -763,5 +897,114 @@ mod tests {
             parsed.first().map(|query| query.index.as_str()),
             Some("books")
         );
+    }
+
+    #[test]
+    fn term_accepts_expanded_case_insensitive_form() {
+        let plan = plan_for(
+            r#"{"query":{"term":{"status":{"value":"Open","case_insensitive":true}}}}"#,
+            &typed("status", "keyword"),
+        );
+        assert!(
+            plan.where_clause
+                .contains(r#"lower("status"::text) = lower($1)"#),
+            "{}",
+            plan.where_clause
+        );
+        assert_eq!(plan.values, vec!["Open"]);
+    }
+
+    #[test]
+    fn range_supports_strict_bounds() {
+        let plan = plan_for(
+            r#"{"query":{"range":{"views":{"gt":1,"lt":9}}}}"#,
+            &typed("views", "long"),
+        );
+        assert!(
+            plan.where_clause.contains(r#""views" > "#),
+            "{}",
+            plan.where_clause
+        );
+        assert!(
+            plan.where_clause.contains(r#""views" < "#),
+            "{}",
+            plan.where_clause
+        );
+        assert_eq!(plan.values, vec!["1", "9"]);
+    }
+
+    #[test]
+    fn wildcard_translates_glob_to_ilike() {
+        let plan = plan_for(
+            r#"{"query":{"wildcard":{"name":{"value":"a*b?c","case_insensitive":true}}}}"#,
+            &FieldTypes::new(),
+        );
+        assert!(
+            plan.where_clause.contains("document ->> 'name' ILIKE $1"),
+            "{}",
+            plan.where_clause
+        );
+        assert_eq!(plan.values, vec!["a%b_c"]);
+    }
+
+    #[test]
+    fn exists_query_tests_presence() {
+        let mapped = plan_for(
+            r#"{"query":{"exists":{"field":"status"}}}"#,
+            &typed("status", "keyword"),
+        );
+        assert!(
+            mapped.where_clause.contains(r#""status" IS NOT NULL"#),
+            "{}",
+            mapped.where_clause
+        );
+
+        let unmapped = plan_for(
+            r#"{"query":{"exists":{"field":"status"}}}"#,
+            &FieldTypes::new(),
+        );
+        assert!(
+            unmapped
+                .where_clause
+                .contains("document -> 'status' IS NOT NULL"),
+            "{}",
+            unmapped.where_clause
+        );
+    }
+
+    #[test]
+    fn exists_and_not_exists_scripts_translate() {
+        let exists = r#"{"query":{"bool":{"must":[{"script":{"script":{"lang":"painless","source":"try {  if (doc.containsKey('tags')) {    if (doc['tags'].value instanceof List) {      return doc['tags'].size() > 0;    } else {      return doc['tags'].value != null;    }  } else {    return false;  }} catch (Exception e) {  return false;}"}}}]}}}"#;
+        let plan = plan_for(exists, &typed("tags", "keyword"));
+        assert!(
+            plan.where_clause.contains(r#""tags" IS NOT NULL"#),
+            "{}",
+            plan.where_clause
+        );
+
+        let not_exists = r#"{"query":{"bool":{"must":[{"script":{"script":{"lang":"painless","source":"if (!doc.containsKey('tags')) return true;if (doc['tags'].size() == 0) return true;return false;"}}}]}}}"#;
+        let plan = plan_for(not_exists, &typed("tags", "keyword"));
+        assert!(
+            plan.where_clause.contains(r#"NOT ("tags" IS NOT NULL)"#),
+            "{}",
+            plan.where_clause
+        );
+    }
+
+    #[test]
+    fn unsupported_query_operand_is_dropped_after_logging() {
+        // `prefix` is not a translated operand: it is logged to stderr and
+        // produces no clause rather than silently corrupting the query.
+        let plan = plan_for(r#"{"query":{"prefix":{"name":"foo"}}}"#, &FieldTypes::new());
+        assert!(plan.where_clause.is_empty(), "{}", plan.where_clause);
+        assert!(plan.values.is_empty(), "{:?}", plan.values);
+    }
+
+    #[test]
+    fn empty_bool_is_not_flagged_as_unmappable() {
+        // An empty bool matches everything; it must produce an empty clause
+        // without being treated as an unmapped operand.
+        let plan = plan_for(r#"{"query":{"bool":{}}}"#, &FieldTypes::new());
+        assert!(plan.where_clause.is_empty(), "{}", plan.where_clause);
     }
 }

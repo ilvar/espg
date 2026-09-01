@@ -182,10 +182,13 @@ Bulk accepts Elasticsearch-style NDJSON `index` action/source pairs.
 
 Supported queries:
 
-- `term`
+- `term` (scalar or expanded `{"value": …, "case_insensitive": …}` form)
 - `match`
 - `terms`
-- `range` with `gte` / `lte`
+- `range` with `gte` / `gt` / `lte` / `lt`
+- `wildcard` (Lucene `*` / `?` globs, case-insensitive)
+- `exists` (including dotted JSONB paths)
+- `script` limited to the field-existence Painless templates emitted by GQL's `EXISTS` / `NOT_EXISTS`
 - `bool.must`
 - `bool.filter`
 - `bool.must_not`
